@@ -14,10 +14,14 @@ import { useProductSearch, type ProductSearchResult } from "@/lib/useProductSear
  */
 export function ProductRegisterForm({
   initialName = "",
+  defaultObservedFrom = null,
   onRegistered,
   onCancel,
 }: {
   initialName?: string;
+  /** 판매 업로드 중 등록할 때처럼, 등록일이 아니라 확인된 판매자료 시작일을 관측 시작일로 미리
+   * 채워야 하는 경우에 넘긴다. 비우면 서버가 오늘 날짜(한국시간)를 기본값으로 쓴다. */
+  defaultObservedFrom?: string | null;
   onRegistered: (p: ProductSearchResult) => void;
   onCancel: () => void;
 }) {
@@ -33,21 +37,31 @@ export function ProductRegisterForm({
   const [sourceCode, setSourceCode] = useState("");
   const [moq, setMoq] = useState("");
   const [orderStep, setOrderStep] = useState("");
+  const [observedFrom, setObservedFrom] = useState(defaultObservedFrom ?? "");
   const [error, setError] = useState<string | null>(null);
 
   const { data: similar } = useProductSearch(name.trim());
 
   const register = useMutation({
     mutationFn: async () => {
-      const aliases = alias.trim()
-        ? [{ source: "manual", source_code: sourceCode.trim() || null, alias: alias.trim() }]
-        : [];
+      // 별칭 문구를 안 쓰고 POS 코드·바코드만 입력해도 코드가 유실되지 않게 한다. 표시용 별칭이
+      // 비어 있으면 상품명·규격으로 채운다(시나리오 6).
+      const aliases =
+        alias.trim() || sourceCode.trim()
+          ? [
+              {
+                source: "manual",
+                source_code: sourceCode.trim() || null,
+                alias: alias.trim() || `${name.trim()} ${spec.trim()}`.trim(),
+              },
+            ]
+          : [];
       const { data, error } = await supabase.rpc("create_product", {
         p_name: name.trim(),
         p_spec: spec.trim(),
         p_base_unit: baseUnit.trim(),
         p_allows_fraction: allowsFraction,
-        p_observed_from: null,
+        p_observed_from: observedFrom.trim() || null,
         p_aliases: aliases,
         p_default_moq: isAdmin && moq.trim() ? Number(moq) : null,
         p_default_order_step: isAdmin && orderStep.trim() ? Number(orderStep) : null,
@@ -119,6 +133,16 @@ export function ProductRegisterForm({
         POS 코드·바코드 (선택)
         <input value={sourceCode} onChange={(e) => setSourceCode(e.target.value)} />
       </label>
+      <label>
+        관측 시작일 (선택, 비우면 오늘)
+        <input type="date" value={observedFrom} onChange={(e) => setObservedFrom(e.target.value)} />
+      </label>
+      {defaultObservedFrom && (
+        <p className="form-message">
+          업로드 중인 판매자료 시작일({defaultObservedFrom})로 미리 채웠습니다. 실제로 그 이전부터
+          취급한 상품이 아니면 값을 고치세요.
+        </p>
+      )}
 
       {isAdmin && (
         <>

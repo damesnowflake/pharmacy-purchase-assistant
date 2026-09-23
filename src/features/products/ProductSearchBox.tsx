@@ -13,10 +13,12 @@ export function ProductSearchBox({
   onSelect,
   placeholder = "상품명·규격·별칭·바코드로 검색",
   allowRegisterNew = true,
+  defaultObservedFrom = null,
 }: {
   onSelect: (p: ProductSearchResult) => void;
   placeholder?: string;
   allowRegisterNew?: boolean;
+  defaultObservedFrom?: string | null;
 }) {
   const [query, setQuery] = useState("");
   const [showRegister, setShowRegister] = useState(false);
@@ -57,6 +59,7 @@ export function ProductSearchBox({
       {allowRegisterNew && showRegister && (
         <ProductRegisterForm
           initialName={query.trim()}
+          defaultObservedFrom={defaultObservedFrom}
           onRegistered={(p) => {
             setShowRegister(false);
             setQuery("");
