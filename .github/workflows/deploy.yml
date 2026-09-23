@@ -1,35 +1,40 @@
 name: Deploy to Cloudflare Pages
 
-# 자동 push 배포가 아니라 수동 실행(workflow_dispatch)으로 시작한다. CLOUDFLARE_API_TOKEN과
-# CLOUDFLARE_ACCOUNT_ID 저장소 시크릿을 설정하기 전에는 이 워크플로를 실행하지 않는다
-# (docs/미확인_항목.md — Cloudflare 계정 연결 필요). 값이 준비되면 아래 `push:` 트리거의
-# 주석을 해제해 main 브랜치 배포 시 자동 실행할 수 있다.
+# Frontend only. Supabase migrations/functions are deployed separately.
 on:
   workflow_dispatch:
-  # push:
-  #   branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: cloudflare-pages-production
+  cancel-in-progress: false
 
 jobs:
   deploy:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
-      deployments: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
       - run: npm test
       - run: npm run build
         env:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
-      - uses: cloudflare/pages-action@v1
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          projectName: pharmacy-purchase-assistant
-          directory: dist
+      - name: Deploy production
+        run: npx --yes wrangler@4.86.0 pages deploy dist --project-name pharmacy-purchase-assistant --branch main
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Check production availability
+        run: curl --fail --silent --show-error --retry 3 --output /dev/null https://pharmacy-purchase-assistant.pages.dev/
