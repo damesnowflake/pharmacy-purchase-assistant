@@ -1,13 +1,37 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabaseClient";
-import { parseFlexibleDate, parseFlexibleQuantity, normalizeAliasText } from "@/lib/salesFileParsing";
+import {
+  parseFlexibleDate,
+  parseFlexibleQuantity,
+  normalizeAliasText,
+  findDateGaps,
+  classifySalesRows,
+  decodeCsvBytes,
+  type RowOverride,
+} from "@/lib/salesFileParsing";
+import {
+  detectCatposTalkFileColumns,
+  parseCatposTalkFileRows,
+  type CatposParseError,
+} from "@/lib/catposTalkFileParser";
 import type { IsoDate } from "@/lib/date";
 
 // IR-02 판매 업로드. FR-05~10.
-// 실제 CatPOS 내보내기 표본이 없어(D-02, docs/미확인_항목.md) 특정 POS 포맷을 가정하지 않는
-// 범용 CSV/XLSX 열 매핑 임포터로 구현했다. 동작은 실제 확인했지만 "CatPOS 호환"이라고
-// 표시하지 않는다 — 실제 파일로 열 구조·반품 표기를 확인한 뒤 파서를 좁혀야 한다.
+// 열이 CatPOS "톡파일" 판매내역 구조(거래 헤더 + 상품상세 텍스트 행, catposTalkFileParser.ts
+// 참고)와 일치하면 전용 파서를 자동으로 쓴다. 이 구조는 사용자가 제공한 실제 판매내역 표본으로
+// 확인했다 — 다만 반품·취소 표현 방식은 그 표본 기간에 사례가 없어 여전히 확인되지 않았다
+// (D-02, docs/미확인_항목.md). 헤더가 일치하지 않으면 열을 직접 지정하는 범용 CSV/XLSX
+// 가져오기로 대체한다.
+//
+// FR-06: "해석할 수 없는 날짜·수량·품목이 있으면 확정 저장 전에 수정할 수 있게 한다... 잘못된
+// 행을 임의의 날짜·수량으로 바꾸거나 조용히 누락하지 않는다." 이 화면은 그래서 세 종류의 행을
+// 구분한다.
+//   1) 완전히 빈 행(품목·날짜·수량 모두 없음) — 표 서식상 흔한 여백이므로 조용히 무시한다.
+//   2) 품목명이 있지만 "건너뛰기"를 직원이 명시적으로 선택한 행(합계·헤더 반복 등 비거래 행으로
+//      직원이 확인한 경우) — 화면에 몇 건인지 표시하되 저장을 막지 않는다.
+//   3) 품목은 실제 상품으로 연결됐는데 날짜·수량을 해석할 수 없는 행 — 실제 거래로 보이므로
+//      저장을 막고, 직원이 값을 고치거나 그 행만 명시적으로 제외해야 다음 단계로 진행된다.
 
 type Step = "pick" | "map" | "match" | "preview" | "done";
 
@@ -24,6 +48,8 @@ interface ProductOption {
 interface ParsedRow {
   rowNo: number;
   rawItem: string;
+  rawDateText: string;
+  rawQtyText: string;
   rawDate: unknown;
   rawQty: unknown;
   isoDate: IsoDate | null;
@@ -37,9 +63,16 @@ async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
     .join("");
 }
 
+function rawToText(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  return String(v);
+}
+
 export function SalesUploadPage() {
   const queryClient = useQueryClient();
   const [step, setStep] = useState<Step>("pick");
+  const [mode, setMode] = useState<"generic" | "catpos">("generic");
   const [fileBuffer, setFileBuffer] = useState<ArrayBuffer | null>(null);
   const [fileName, setFileName] = useState<string>("");
   const [headers, setHeaders] = useState<string[]>([]);
@@ -47,8 +80,15 @@ export function SalesUploadPage() {
   const [dateCol, setDateCol] = useState("");
   const [itemCol, setItemCol] = useState("");
   const [qtyCol, setQtyCol] = useState("");
+  const [catposLineItems, setCatposLineItems] = useState<
+    { rowNo: number; itemNameRaw: string; saleDate: IsoDate; quantity: number }[]
+  >([]);
+  const [catposErrors, setCatposErrors] = useState<CatposParseError[]>([]);
+  const [catposErrorsAcknowledged, setCatposErrorsAcknowledged] = useState(false);
   const [itemMatches, setItemMatches] = useState<Record<string, string | "skip">>({});
   const [productOptions, setProductOptions] = useState<ProductOption[]>([]);
+  const [rowOverrides, setRowOverrides] = useState<Record<number, RowOverride>>({});
+  const [gapsAcknowledged, setGapsAcknowledged] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [result, setResult] = useState<{ applied_rows: number; skipped_rows: number; affected_products: number } | null>(
     null,
@@ -58,7 +98,17 @@ export function SalesUploadPage() {
     setMessage(null);
     const buffer = await file.arrayBuffer();
     const { read, utils } = await import("xlsx"); // 초기 번들 크기를 줄이기 위해 필요할 때만 불러온다.
-    const wb = read(buffer, { type: "array", cellDates: true });
+
+    // CSV는 SheetJS에 원시 버퍼를 그대로 넘기면 BOM 없는 UTF-8을 다른 코드페이지로 오인식해
+    // 한글이 깨질 수 있어(decodeCsvBytes 주석 참고) 직접 디코드한 문자열로 읽는다.
+    // cellDates는 두 형식 모두 false로 둔다: 날짜 셀을 JS Date로 바꾸면(SheetJS가 CSV의 날짜
+    // "문자열"을 브라우저 로컬 시간대로 해석해) 자정 근처 날짜가 하루 밀리는 문제가 있었다.
+    // 대신 엑셀 일련번호(숫자) 또는 원문 문자열로 받아 parseFlexibleDate가 시간대와 무관하게
+    // 직접 해석하게 한다.
+    const isCsv = file.name.toLowerCase().endsWith(".csv");
+    const wb = isCsv
+      ? read(decodeCsvBytes(new Uint8Array(buffer)), { type: "string", cellDates: false })
+      : read(buffer, { type: "array", cellDates: false });
     const sheet = wb.Sheets[wb.SheetNames[0]];
     const asArrays = utils.sheet_to_json<unknown[]>(sheet, { header: 1, defval: null });
     if (asArrays.length < 2) {
@@ -66,14 +116,41 @@ export function SalesUploadPage() {
       return;
     }
     const headerRow = asArrays[0].map((h) => String(h ?? "").trim());
-    const dataRows: SheetRow[] = asArrays.slice(1).map((arr) => {
+    const dataRowsRaw = asArrays.slice(1);
+
+    setFileBuffer(buffer);
+    setFileName(file.name);
+    setHeaders(headerRow);
+    setRowOverrides({});
+    setGapsAcknowledged(false);
+    setCatposErrorsAcknowledged(false);
+    setProductOptions([]);
+    setItemMatches({});
+
+    const catposColumns = detectCatposTalkFileColumns(headerRow);
+    if (catposColumns) {
+      // CatPOS 톡파일 구조로 인식됨: 거래 헤더+상품상세 행을 바로 해석해 열 매핑 단계를 건너뛴다.
+      const parsed = parseCatposTalkFileRows(dataRowsRaw, catposColumns);
+      setMode("catpos");
+      setCatposLineItems(
+        parsed.lineItems.map((li) => ({
+          rowNo: li.rowNo,
+          itemNameRaw: li.itemNameRaw,
+          saleDate: li.saleDate,
+          quantity: li.quantity,
+        })),
+      );
+      setCatposErrors(parsed.errors);
+      setStep("match");
+      return;
+    }
+
+    setMode("generic");
+    const dataRows: SheetRow[] = dataRowsRaw.map((arr) => {
       const obj: SheetRow = {};
       headerRow.forEach((h, i) => (obj[h] = arr[i]));
       return obj;
     });
-    setFileBuffer(buffer);
-    setFileName(file.name);
-    setHeaders(headerRow);
     setRows(dataRows);
 
     // 흔한 한글 헤더명으로 기본값을 추정한다. 실제 CatPOS 헤더와 다를 수 있어 사용자가 확인·수정한다.
@@ -85,76 +162,130 @@ export function SalesUploadPage() {
   }
 
   const parsedRows: ParsedRow[] = useMemo(() => {
+    if (mode === "catpos") {
+      return catposLineItems.map((li) => ({
+        rowNo: li.rowNo,
+        rawItem: li.itemNameRaw,
+        rawDateText: li.saleDate,
+        rawQtyText: String(li.quantity),
+        rawDate: li.saleDate,
+        rawQty: li.quantity,
+        isoDate: li.saleDate,
+        qty: li.quantity,
+      }));
+    }
     if (step === "pick" || !dateCol || !itemCol || !qtyCol) return [];
     return rows.map((r, i) => {
       const rawItem = String(r[itemCol] ?? "").trim();
       const rawDate = r[dateCol];
       const rawQty = r[qtyCol];
+      const isoDate = parseFlexibleDate(rawDate);
       return {
         rowNo: i + 1,
         rawItem,
+        // 날짜 열은 엑셀 일련번호(숫자)로 들어올 수 있어, 해석에 성공했으면 사람이 읽고 고칠 수
+        // 있는 IsoDate 문자열을 기본 표시값으로 쓴다(원문 숫자를 그대로 보여주지 않는다).
+        rawDateText: isoDate ?? rawToText(rawDate),
+        rawQtyText: rawToText(rawQty),
         rawDate,
         rawQty,
-        isoDate: parseFlexibleDate(rawDate),
+        isoDate,
         qty: parseFlexibleQuantity(rawQty),
       };
     });
-  }, [rows, dateCol, itemCol, qtyCol, step]);
+  }, [rows, dateCol, itemCol, qtyCol, step, mode, catposLineItems]);
+
+  // 품목·날짜·수량이 모두 비어 있는 행만 "완전히 빈 행"으로 조용히 무시한다. 그 외에는 실제
+  // 거래 행일 가능성이 있으므로 무시하지 않는다.
+  const isBlankRow = (r: ParsedRow) => !r.rawItem && !r.rawDateText.trim() && !r.rawQtyText.trim();
+
+  const contentRows = useMemo(() => parsedRows.filter((r) => !isBlankRow(r)), [parsedRows]);
+  const blankRowCount = parsedRows.length - contentRows.length;
 
   const distinctItems = useMemo(
-    () => Array.from(new Set(parsedRows.map((r) => r.rawItem).filter(Boolean))),
-    [parsedRows],
+    () => Array.from(new Set(contentRows.map((r) => r.rawItem).filter(Boolean))),
+    [contentRows],
   );
 
-  async function goToMatching() {
-    setMessage(null);
-    const { data, error } = await supabase
-      .from("products")
-      .select("id, name, spec, product_aliases(alias, normalized_alias)")
-      .eq("active", true);
-    if (error) {
-      setMessage(`품목 목록 조회 실패: ${error.message}`);
-      return;
-    }
-    const options = (data ?? []).map((p) => ({ id: p.id as string, name: p.name as string, spec: p.spec as string }));
-    setProductOptions(options);
-
-    const aliasIndex = new Map<string, string>();
-    for (const p of data ?? []) {
-      aliasIndex.set(normalizeAliasText(p.name as string), p.id as string);
-      for (const a of (p.product_aliases ?? []) as { normalized_alias: string }[]) {
-        aliasIndex.set(a.normalized_alias, p.id as string);
+  // match 단계에 처음 들어올 때 품목 목록을 불러와 별칭으로 자동 매칭한다. 일반 가져오기(열
+  // 매핑 후 버튼 클릭)와 CatPOS 자동 인식(파일 선택 즉시 match로 건너뜀) 양쪽 모두 이 단계에
+  // 진입하는 시점의 distinctItems를 기준으로 하므로, 진입 경로와 무관하게 항상 최신값을 쓴다.
+  useEffect(() => {
+    if (step !== "match" || productOptions.length > 0) return;
+    let cancelled = false;
+    (async () => {
+      setMessage(null);
+      const { data, error } = await supabase
+        .from("products")
+        .select("id, name, spec, product_aliases(alias, normalized_alias)")
+        .eq("active", true);
+      if (cancelled) return;
+      if (error) {
+        setMessage(`품목 목록 조회 실패: ${error.message}`);
+        return;
       }
-    }
-    const initial: Record<string, string | "skip"> = {};
-    for (const item of distinctItems) {
-      const found = aliasIndex.get(normalizeAliasText(item));
-      if (found) initial[item] = found;
-    }
-    setItemMatches(initial);
-    setStep("match");
-  }
+      const options = (data ?? []).map((p) => ({ id: p.id as string, name: p.name as string, spec: p.spec as string }));
+      setProductOptions(options);
 
+      const aliasIndex = new Map<string, string>();
+      for (const p of data ?? []) {
+        aliasIndex.set(normalizeAliasText(p.name as string), p.id as string);
+        for (const a of (p.product_aliases ?? []) as { normalized_alias: string }[]) {
+          aliasIndex.set(a.normalized_alias, p.id as string);
+        }
+      }
+      const initial: Record<string, string | "skip"> = {};
+      for (const item of distinctItems) {
+        const found = aliasIndex.get(normalizeAliasText(item));
+        if (found) initial[item] = found;
+      }
+      setItemMatches(initial);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, productOptions.length]);
+
+  // 품목명이 있는데 아직 아무것도 선택하지 않은 경우만 "미연결"로 본다. 품목명이 비어 있는
+  // 행(날짜·수량만 있는 이상 행)은 품목 매칭 단계에서 처리할 대상이 아니라, 아래 행별 문제
+  // 목록에서 다룬다.
   const unresolvedCount = distinctItems.filter((i) => !itemMatches[i]).length;
 
-  const validRows = useMemo(() => {
-    return parsedRows
-      .map((r) => {
-        const matched = itemMatches[r.rawItem];
-        if (!matched || matched === "skip") return null;
-        if (r.isoDate === null || r.qty === null) return null;
-        return { productId: matched, saleDate: r.isoDate, netQty: r.qty };
-      })
-      .filter((r): r is { productId: string; saleDate: IsoDate; netQty: number } => r !== null);
-  }, [parsedRows, itemMatches]);
+  const contentRowsByRowNo = useMemo(() => new Map(contentRows.map((r) => [r.rowNo, r])), [contentRows]);
 
-  const invalidCount = parsedRows.length - validRows.length;
-  const periodStart = validRows.length > 0 ? validRows.reduce((a, b) => (b.saleDate < a ? b.saleDate : a), validRows[0].saleDate) : null;
-  const periodEnd = validRows.length > 0 ? validRows.reduce((a, b) => (b.saleDate > a ? b.saleDate : a), validRows[0].saleDate) : null;
+  const classified = useMemo(
+    () => classifySalesRows(contentRows, itemMatches, rowOverrides),
+    [contentRows, itemMatches, rowOverrides],
+  );
+
+  const { valid: validRows, skippedByItemChoice, excludedByUser } = classified;
+  // 렌더링에는 원본 rawDateText/rawQtyText(표시용)가 필요하므로 rowNo로 원본 행을 다시 찾는다.
+  const blockingIssues = classified.blocking.map((b) => contentRowsByRowNo.get(b.rowNo)!);
+
+  const periodStart =
+    validRows.length > 0 ? validRows.reduce((a, b) => (b.saleDate < a ? b.saleDate : a), validRows[0].saleDate) : null;
+  const periodEnd =
+    validRows.length > 0 ? validRows.reduce((a, b) => (b.saleDate > a ? b.saleDate : a), validRows[0].saleDate) : null;
+
+  const dateGaps = useMemo(() => {
+    if (!periodStart || !periodEnd) return [];
+    const present = new Set(validRows.map((r) => r.saleDate));
+    return findDateGaps(present, periodStart, periodEnd);
+  }, [validRows, periodStart, periodEnd]);
+
+  const canSave =
+    blockingIssues.length === 0 && validRows.length > 0 && (dateGaps.length === 0 || gapsAcknowledged);
+
+  function updateOverride(rowNo: number, patch: Partial<RowOverride>) {
+    setRowOverrides((prev) => ({ ...prev, [rowNo]: { ...prev[rowNo], ...patch } }));
+    setGapsAcknowledged(false);
+  }
 
   const submit = useMutation({
     mutationFn: async () => {
       if (!fileBuffer || !periodStart || !periodEnd) throw new Error("업로드할 유효한 행이 없습니다.");
+      if (blockingIssues.length > 0) throw new Error("해석되지 않은 거래 행이 남아 있습니다.");
       const fileHash = await sha256Hex(fileBuffer);
 
       const { data: beginData, error: beginError } = await supabase.rpc("begin_sales_import", {
@@ -210,9 +341,11 @@ export function SalesUploadPage() {
     <div className="sales-upload-page">
       <h2>판매 업로드</h2>
       <p className="form-message">
-        실제 CatPOS 내보내기 열 이름이 확인되지 않아 열 매핑을 직접 확인하는 범용 가져오기입니다
-        (docs/미확인_항목.md D-02). 반품·취소가 파일에 별도 행으로 표시되는지는 실제 표본으로
-        확인해야 하며, 지금은 입력한 수량을 그대로 순판매수량으로 합산합니다.
+        CatPOS 톡파일 판매내역과 같은 열 구조(no·판매일자·판매상품·거래구분 등)면 자동으로
+        인식해 바로 품목을 연결합니다. 그 구조가 아니면 열을 직접 지정하는 범용 CSV/XLSX
+        가져오기로 진행합니다. 두 경우 모두 반품·취소가 실제로 어떻게 표시되는지는 사례로
+        확인하지 못했습니다(docs/미확인_항목.md D-02) — 지금은 입력된 수량을 그대로
+        순판매수량으로 반영합니다.
       </p>
       {message && <p className="form-message error-text">{message}</p>}
 
@@ -257,7 +390,7 @@ export function SalesUploadPage() {
               ))}
             </select>
           </label>
-          <button type="button" disabled={!dateCol || !itemCol || !qtyCol} onClick={goToMatching}>
+          <button type="button" disabled={!dateCol || !itemCol || !qtyCol} onClick={() => setStep("match")}>
             다음: 품목 연결
           </button>
         </div>
@@ -265,6 +398,46 @@ export function SalesUploadPage() {
 
       {step === "match" && (
         <div>
+          {mode === "catpos" && (
+            <p className="form-message">
+              CatPOS 톡파일 판매내역 구조로 인식해 열 매핑 없이 바로 품목을 연결합니다. 반품·취소
+              표현 방식은 아직 실제 사례로 확인하지 못했습니다(docs/미확인_항목.md D-02).
+            </p>
+          )}
+          {mode === "catpos" && catposErrors.length > 0 && (
+            <div>
+              <p className="form-message error-text">
+                {catposErrors.length}개 행의 형식을 해석할 수 없어 조용히 빠뜨리지 않고 목록으로
+                남겼습니다. 파일이 예상과 다른 구조라는 뜻일 수 있습니다. 아래 내용을 확인한 뒤
+                진행하세요.
+              </p>
+              <table className="dense-table">
+                <thead>
+                  <tr>
+                    <th>파일 내 위치</th>
+                    <th>사유</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {catposErrors.slice(0, 20).map((e, i) => (
+                    <tr key={i}>
+                      <td>{e.rowIndex + 2}행째</td>
+                      <td>{e.reason}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {catposErrors.length > 20 && <p>...외 {catposErrors.length - 20}건</p>}
+              <label style={{ flexDirection: "row", alignItems: "center", gap: "6px" }}>
+                <input
+                  type="checkbox"
+                  checked={catposErrorsAcknowledged}
+                  onChange={(e) => setCatposErrorsAcknowledged(e.target.checked)}
+                />
+                위 행들은 이번 업로드에 반영되지 않는다는 것을 확인했습니다.
+              </label>
+            </div>
+          )}
           <p>서로 다른 품목명 {distinctItems.length}개 중 미연결 {unresolvedCount}개</p>
           <table className="dense-table">
             <thead>
@@ -285,7 +458,7 @@ export function SalesUploadPage() {
                       }
                     >
                       <option value="">선택 필요</option>
-                      <option value="skip">건너뛰기(반영하지 않음)</option>
+                      <option value="skip">건너뛰기(거래 행이 아님으로 확인)</option>
                       {productOptions.map((p) => (
                         <option key={p.id} value={p.id}>
                           {p.name} {p.spec}
@@ -297,7 +470,11 @@ export function SalesUploadPage() {
               ))}
             </tbody>
           </table>
-          <button type="button" disabled={unresolvedCount > 0} onClick={() => setStep("preview")}>
+          <button
+            type="button"
+            disabled={unresolvedCount > 0 || (mode === "catpos" && catposErrors.length > 0 && !catposErrorsAcknowledged)}
+            onClick={() => setStep("preview")}
+          >
             다음: 미리보기
           </button>
         </div>
@@ -306,17 +483,103 @@ export function SalesUploadPage() {
       {step === "preview" && (
         <div>
           <p>
-            자료 기간: {periodStart} ~ {periodEnd} · 반영 예정 {validRows.length}행 · 해석 불가/건너뜀{" "}
-            {invalidCount}행
+            반영 예정 {validRows.length}행 · 빈 행(무시됨) {blankRowCount}건 · 건너뛰기로 확인한
+            품목의 행 {skippedByItemChoice}건 · 직접 제외한 행 {excludedByUser}건
           </p>
-          <p className="form-message">
-            같은 기간의 기존 판매 집계는 이 파일 내용으로 통째로 교체됩니다 (전체기간 보고서 처리
-            방식, FR-07).
-          </p>
-          <button type="button" onClick={() => setStep("map")}>
+
+          {blockingIssues.length > 0 && (
+            <div>
+              <p className="form-message error-text">
+                아래 {blockingIssues.length}개 행은 품목은 확인됐지만 날짜 또는 수량을 해석할 수
+                없어 조용히 빠뜨릴 수 없습니다. 값을 고치거나, 거래 행이 아니라면 제외로
+                표시하세요. 해결되기 전에는 저장할 수 없습니다.
+              </p>
+              <table className="dense-table">
+                <thead>
+                  <tr>
+                    <th>행</th>
+                    <th>품목(파일)</th>
+                    <th>날짜 입력</th>
+                    <th>수량 입력</th>
+                    <th>제외</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {blockingIssues.map((r) => {
+                    const ov = rowOverrides[r.rowNo] ?? {};
+                    const dateText = ov.dateText ?? r.rawDateText;
+                    const qtyText = ov.qtyText ?? r.rawQtyText;
+                    const dateOk = parseFlexibleDate(dateText) !== null;
+                    const qtyOk = parseFlexibleQuantity(qtyText) !== null;
+                    return (
+                      <tr key={r.rowNo}>
+                        <td>{r.rowNo}</td>
+                        <td>{r.rawItem || "(품목명 없음)"}</td>
+                        <td>
+                          <input
+                            value={dateText}
+                            onChange={(e) => updateOverride(r.rowNo, { dateText: e.target.value })}
+                            style={{ borderColor: dateOk ? undefined : "var(--danger)" }}
+                          />
+                          {!dateOk && <div className="warning-badge">해석 불가</div>}
+                        </td>
+                        <td>
+                          <input
+                            value={qtyText}
+                            onChange={(e) => updateOverride(r.rowNo, { qtyText: e.target.value })}
+                            style={{ borderColor: qtyOk ? undefined : "var(--danger)" }}
+                          />
+                          {!qtyOk && <div className="warning-badge">해석 불가</div>}
+                        </td>
+                        <td>
+                          <input
+                            type="checkbox"
+                            checked={Boolean(ov.excluded)}
+                            onChange={(e) => updateOverride(r.rowNo, { excluded: e.target.checked })}
+                            title="이 행은 거래 행이 아님을 확인함"
+                          />
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {blockingIssues.length === 0 && periodStart && periodEnd && (
+            <>
+              <p>
+                자료 기간: {periodStart} ~ {periodEnd}
+              </p>
+              {dateGaps.length > 0 && (
+                <div>
+                  <p className="form-message error-text">
+                    이 기간 안에 자료가 전혀 없는 날짜가 {dateGaps.length}개 있습니다: {" "}
+                    {dateGaps.join(", ")}. 실제로 판매가 없었던 날인지, 파일에서 빠진 날인지 확인
+                    되지 않으면 이 날짜들도 "판매자료 확보 완료"로 잘못 기록될 수 있습니다.
+                  </p>
+                  <label style={{ flexDirection: "row", alignItems: "center", gap: "6px" }}>
+                    <input
+                      type="checkbox"
+                      checked={gapsAcknowledged}
+                      onChange={(e) => setGapsAcknowledged(e.target.checked)}
+                    />
+                    위 날짜들은 실제로 판매가 없었음을 확인했습니다(파일 누락이 아닙니다).
+                  </label>
+                </div>
+              )}
+              <p className="form-message">
+                같은 기간의 기존 판매 집계는 이 파일 내용으로 통째로 교체됩니다 (전체기간 보고서
+                처리 방식, FR-07).
+              </p>
+            </>
+          )}
+
+          <button type="button" onClick={() => setStep(mode === "catpos" ? "match" : "map")}>
             뒤로
           </button>
-          <button type="button" disabled={submit.isPending || validRows.length === 0} onClick={() => submit.mutate()}>
+          <button type="button" disabled={submit.isPending || !canSave} onClick={() => submit.mutate()}>
             {submit.isPending ? "저장 중..." : "저장"}
           </button>
         </div>
@@ -334,7 +597,14 @@ export function SalesUploadPage() {
               setStep("pick");
               setFileBuffer(null);
               setRows([]);
+              setCatposLineItems([]);
+              setCatposErrors([]);
+              setCatposErrorsAcknowledged(false);
               setResult(null);
+              setRowOverrides({});
+              setGapsAcknowledged(false);
+              setProductOptions([]);
+              setItemMatches({});
             }}
           >
             새 파일 업로드
