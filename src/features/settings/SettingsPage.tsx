@@ -5,6 +5,7 @@ import { SuppliersPanel } from "./SuppliersPanel";
 import { CapacityPanel } from "./CapacityPanel";
 import { ProductSearchBox } from "@/features/products/ProductSearchBox";
 import { ProductRegisterForm } from "@/features/products/ProductRegisterForm";
+import { useProductUnits } from "@/lib/useProductUnits";
 import type { ProductSearchResult } from "@/lib/useProductSearch";
 
 interface ProductRow {
@@ -43,53 +44,33 @@ export function SettingsPage() {
 
 function ProductSettingsPanel() {
   const queryClient = useQueryClient();
-  const [edits, setEdits] = useState<Record<string, { moq: string; step: string }>>({});
   const [message, setMessage] = useState<string | null>(null);
   const [showRegister, setShowRegister] = useState(false);
-  const [highlightId, setHighlightId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
 
-  const { data, isLoading, error } = useQuery({
-    queryKey: ["products", "settings"],
+  // 선택된 상품 하나만 조회한다. 상품이 수천 개여도(실제 배포 환경 기준) 전체를 한 번에 내려받지
+  // 않는다 — 예전에는 활성 상품 전체를 select해 PostgREST 기본 응답 제한(1,000행)에 걸리면
+  // 뒤쪽 상품이 화면에서 통째로 사라졌다.
+  const { data: selected, isLoading } = useQuery({
+    queryKey: ["products", "settings", selectedId],
     queryFn: async () => {
       const { data, error } = await supabase
         .from("products")
         .select("id, name, spec, base_unit, default_moq, default_order_step, version")
-        .eq("active", true)
-        .order("name");
+        .eq("id", selectedId as string)
+        .single();
       if (error) throw error;
-      return data as ProductRow[];
+      return data as ProductRow;
     },
+    enabled: Boolean(selectedId),
   });
 
   function handleRegistered(p: ProductSearchResult) {
     setMessage(`${p.name} ${p.spec} 등록(또는 기존 선택) 완료.`);
     setShowRegister(false);
-    setHighlightId(p.product_id);
+    setSelectedId(p.product_id);
     queryClient.invalidateQueries({ queryKey: ["products"] });
   }
-
-  const save = useMutation({
-    mutationFn: async (p: ProductRow) => {
-      const edit = edits[p.id];
-      const moq = edit?.moq !== undefined ? Number(edit.moq) : p.default_moq;
-      const step = edit?.step !== undefined ? Number(edit.step) : p.default_order_step;
-      const { error } = await supabase.rpc("save_product_settings", {
-        p_product_id: p.id,
-        p_expected_version: p.version,
-        p_default_moq: moq,
-        p_default_order_step: step,
-      });
-      if (error) throw error;
-    },
-    onSuccess: () => {
-      setMessage("저장되었습니다.");
-      queryClient.invalidateQueries({ queryKey: ["products"] });
-    },
-    onError: (e: Error) => setMessage(`저장 실패: ${e.message}`),
-  });
-
-  if (isLoading) return <div className="center-message">불러오는 중...</div>;
-  if (error) return <div className="center-message error">조회 실패: {(error as Error).message}</div>;
 
   return (
     <div>
@@ -98,8 +79,8 @@ function ProductSettingsPanel() {
 
       <ProductSearchBox
         allowRegisterNew={false}
-        placeholder="품목 검색 (아래 표에서 강조 표시)"
-        onSelect={(p) => setHighlightId(p.product_id)}
+        placeholder="품목 검색 후 선택하면 아래에서 MOQ·발주단위·포장단위를 고칠 수 있습니다"
+        onSelect={(p) => setSelectedId(p.product_id)}
       />
 
       <button type="button" onClick={() => setShowRegister((v) => !v)}>
@@ -107,55 +88,122 @@ function ProductSettingsPanel() {
       </button>
       {showRegister && <ProductRegisterForm onRegistered={handleRegistered} onCancel={() => setShowRegister(false)} />}
 
-      <h3>MOQ·발주 단위</h3>
-      <table className="dense-table">
-        <thead>
-          <tr>
-            <th>품목</th>
-            <th>규격</th>
-            <th className="num">MOQ</th>
-            <th className="num">발주 단위</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {(data ?? []).map((p) => (
-            <tr key={p.id} style={highlightId === p.id ? { outline: "2px solid var(--accent)" } : undefined}>
-              <td>{p.name}</td>
-              <td>{p.spec}</td>
-              <td className="num">
-                <input
-                  type="number"
-                  min="0"
-                  step="any"
-                  defaultValue={p.default_moq ?? ""}
-                  placeholder="입력 필요"
-                  onChange={(e) =>
-                    setEdits((prev) => ({ ...prev, [p.id]: { ...prev[p.id], moq: e.target.value } }))
-                  }
-                />
-              </td>
-              <td className="num">
-                <input
-                  type="number"
-                  min="0"
-                  step="any"
-                  defaultValue={p.default_order_step ?? ""}
-                  placeholder="입력 필요"
-                  onChange={(e) =>
-                    setEdits((prev) => ({ ...prev, [p.id]: { ...prev[p.id], step: e.target.value } }))
-                  }
-                />
-              </td>
-              <td>
-                <button type="button" onClick={() => save.mutate(p)} disabled={save.isPending}>
-                  저장
-                </button>
-              </td>
+      {isLoading && <p className="form-message">불러오는 중...</p>}
+      {selected && <ProductEditCard product={selected} onSaved={(m) => setMessage(m)} />}
+    </div>
+  );
+}
+
+function ProductEditCard({ product, onSaved }: { product: ProductRow; onSaved: (m: string) => void }) {
+  const queryClient = useQueryClient();
+  const [moq, setMoq] = useState(String(product.default_moq ?? ""));
+  const [step, setStep] = useState(String(product.default_order_step ?? ""));
+  const { data: units, isLoading: unitsLoading } = useProductUnits(product.id);
+  const [newUnitCode, setNewUnitCode] = useState("");
+  const [newUnitFactor, setNewUnitFactor] = useState("");
+
+  const saveSettings = useMutation({
+    mutationFn: async () => {
+      const { error } = await supabase.rpc("save_product_settings", {
+        p_product_id: product.id,
+        p_expected_version: product.version,
+        p_default_moq: moq.trim() ? Number(moq) : null,
+        p_default_order_step: step.trim() ? Number(step) : null,
+      });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      onSaved("MOQ·발주 단위를 저장했습니다.");
+      queryClient.invalidateQueries({ queryKey: ["products", "settings"] });
+    },
+    onError: (e: Error) => onSaved(`저장 실패: ${e.message}`),
+  });
+
+  const saveUnit = useMutation({
+    mutationFn: async (input: { unitCode: string; factor: number | null; remove: boolean }) => {
+      const { error } = await supabase.rpc("save_product_unit", {
+        p_product_id: product.id,
+        p_unit_code: input.unitCode,
+        p_factor_to_base: input.factor,
+        p_remove: input.remove,
+      });
+      if (error) throw error;
+    },
+    onSuccess: (_d, input) => {
+      onSaved(input.remove ? "단위를 삭제했습니다." : "포장 단위를 저장했습니다.");
+      setNewUnitCode("");
+      setNewUnitFactor("");
+      queryClient.invalidateQueries({ queryKey: ["product_units", product.id] });
+    },
+    onError: (e: Error) => onSaved(`단위 저장 실패: ${e.message}`),
+  });
+
+  return (
+    <div style={{ border: "1px solid var(--border)", borderRadius: "6px", padding: "10px", marginTop: "10px" }}>
+      <h3>
+        {product.name} {product.spec} (기준단위: {product.base_unit})
+      </h3>
+
+      <label>
+        MOQ (없으면 추천 계산 시 입력 필요로 표시)
+        <input type="number" min="0" step="any" value={moq} onChange={(e) => setMoq(e.target.value)} />
+      </label>
+      <label>
+        발주 단위
+        <input type="number" min="0" step="any" value={step} onChange={(e) => setStep(e.target.value)} />
+      </label>
+      <button type="button" disabled={saveSettings.isPending} onClick={() => saveSettings.mutate()}>
+        {saveSettings.isPending ? "저장 중..." : "MOQ·발주 단위 저장"}
+      </button>
+
+      <h4 style={{ marginTop: "12px" }}>포장 단위</h4>
+      {unitsLoading && <p className="form-message">불러오는 중...</p>}
+      {units && (
+        <table className="dense-table">
+          <thead>
+            <tr>
+              <th>단위</th>
+              <th className="num">기준단위 환산값</th>
+              <th></th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {units.map((u) => (
+              <tr key={u.unit_code}>
+                <td>{u.unit_code}</td>
+                <td className="num">{u.factor_to_base}</td>
+                <td>
+                  {u.unit_code !== product.base_unit && (
+                    <button
+                      type="button"
+                      onClick={() => saveUnit.mutate({ unitCode: u.unit_code, factor: null, remove: true })}
+                    >
+                      삭제
+                    </button>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      <div style={{ display: "flex", gap: "6px", alignItems: "flex-end" }}>
+        <label>
+          새 단위 (예: 박스)
+          <input value={newUnitCode} onChange={(e) => setNewUnitCode(e.target.value)} />
+        </label>
+        <label>
+          {product.base_unit} 환산값 (예: 박스=10{product.base_unit}이면 10)
+          <input type="number" min="0" step="any" value={newUnitFactor} onChange={(e) => setNewUnitFactor(e.target.value)} />
+        </label>
+        <button
+          type="button"
+          disabled={!newUnitCode.trim() || !newUnitFactor.trim() || saveUnit.isPending}
+          onClick={() => saveUnit.mutate({ unitCode: newUnitCode.trim(), factor: Number(newUnitFactor), remove: false })}
+        >
+          추가·수정
+        </button>
+      </div>
     </div>
   );
 }
