@@ -13,6 +13,8 @@ for migration in "$repo_dir"/supabase/migrations/*.sql; do
   "${psql_cmd[@]}" -f "$migration" >> "$test_dir/migrations.log"
 done
 "${psql_cmd[@]}" -f "$repo_dir/tests/sql/review_five_fixes.sql"
+"${psql_cmd[@]}" -f "$repo_dir/tests/sql/workflow_validation.sql"
+"${psql_cmd[@]}" -f "$repo_dir/tests/sql/blocked_queue.sql"
 "${psql_cmd[@]}" -f "$repo_dir/tests/sql/queue_concurrency_setup.sql" >> "$test_dir/migrations.log"
 # The first session keeps its row lock while the second attempts a claim.
 "${psql_cmd[@]}" -f "$repo_dir/tests/sql/queue_concurrency_worker.sql" > "$test_dir/worker-a.log" &

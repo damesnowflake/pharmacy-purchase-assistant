@@ -5,7 +5,7 @@ import { useRealtimeInvalidate } from "@/lib/useRealtimeInvalidate";
 // 시스템_구조_설계.md: 상단 검색·판매자료 기준일, 중앙 표, 다크/라이트 테마.
 export function AppLayout() {
   const { profile, signOut } = useAuth();
-  useRealtimeInvalidate(Boolean(profile?.active));
+  const realtime = useRealtimeInvalidate(Boolean(profile?.active));
 
   return (
     <div className="app-shell">
@@ -24,6 +24,11 @@ export function AppLayout() {
           <button onClick={signOut}>로그아웃</button>
         </div>
       </header>
+      {profile?.active && realtime !== "connected" && (
+        <p role="status" className="form-message">
+          {realtime === "connecting" ? "실시간 연결 중…" : "실시간 연결 재시도 중 — 30초마다 자료를 새로 확인합니다."}
+        </p>
+      )}
       <main className="app-main">
         <Outlet />
       </main>

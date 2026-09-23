@@ -44,7 +44,8 @@ export function ReviewPage() {
     queryFn: async () => {
       const { data, error } = await supabase.rpc("calc_status_summary");
       if (error) throw error;
-      return data as { calculating: number; blocked: number; review: number };
+      return data as { calculating: number; blocked: number; review: number;
+        missing_reference?: number; missing_moq?: number; missing_order_step?: number };
     },
     refetchInterval: 30_000,
   });
@@ -84,6 +85,9 @@ export function ReviewPage() {
         <p className="form-message">
           계산 중 {calcSummary.calculating}개 · 조건 확인 필요 {calcSummary.blocked}개 · 사입 검토{" "}
           {calcSummary.review}개
+          {calcSummary.missing_reference !== undefined && (
+            <span> · 입고/실사 필요 {calcSummary.missing_reference}개 · MOQ 필요 {calcSummary.missing_moq}개 · 발주단위 필요 {calcSummary.missing_order_step}개 (중복 집계)</span>
+          )}
         </p>
       )}
       <div style={{ display: "flex", gap: "4px", marginBottom: "8px" }}>

@@ -80,9 +80,11 @@ begin
   result := finish_recompute_item(product_id, job.lease_token, job.required_revision, 'blocked',
     '{"calc_reason":"holiday_missing"}');
   perform pg_temp.assert_true(result = 'blocked', 'missing holiday reported');
-  perform pg_temp.assert_true((select status from recompute_queue) = 'pending', 'missing holiday stays retryable');
+  perform pg_temp.assert_true((select status from recompute_queue) = 'blocked', 'missing holiday sleeps');
   perform pg_temp.assert_true((select calc_reason from product_state) = 'holiday_missing', 'blocked reason visible');
 
+  perform pg_temp.assert_true((select count(*) from claim_recompute_batch(20,300)) = 0, 'blocked work is not reclaimed');
+  perform requeue_blocked_for_holiday();
   select * into job from claim_recompute_batch(20,300);
   update recompute_queue set lease_until = now() - interval '1 second';
   result := finish_recompute_item(product_id, job.lease_token, job.required_revision, 'done', payload);

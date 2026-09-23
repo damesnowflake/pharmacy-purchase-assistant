@@ -2,7 +2,7 @@ import { Fragment, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabaseClient";
 import { useAuth } from "@/features/auth/AuthContext";
-import { getBusinessDate } from "@/lib/date";
+import { getBusinessDate, toKstDatetimeLocal, revisedEventTimestamp } from "@/lib/date";
 import { useIdempotentRequest } from "@/lib/useIdempotentRequest";
 import type { ProductSearchResult } from "@/lib/useProductSearch";
 
@@ -512,14 +512,15 @@ function ReviseEventForm({
   const { profile } = useAuth();
   const [qty, setQty] = useState(String(row.input_qty));
   const [unit, setUnit] = useState(row.input_unit);
-  const [occurredAt, setOccurredAt] = useState(row.occurred_at.slice(0, 16));
+  const [occurredAt, setOccurredAt] = useState(toKstDatetimeLocal(row.occurred_at));
   const [reason, setReason] = useState("");
   const [error, setError] = useState<string | null>(null);
   const { getRequestId, clearPending } = useIdempotentRequest(`revise:${profile?.user_id ?? ""}:${row.event_id}`);
 
   const submit = useMutation({
     mutationFn: async (input: { void: boolean }) => {
-      const requestId = getRequestId(JSON.stringify({ void: input.void, qty, unit, occurredAt, reason }));
+      const timestamp = input.void ? null : revisedEventTimestamp(row.occurred_at, occurredAt);
+      const requestId = getRequestId(JSON.stringify({ version: row.version, void: input.void, qty, unit, timestamp, reason }));
       const { error } = await supabase.rpc("revise_quantity_event", {
         p_request_id: requestId,
         p_event_id: row.event_id,
@@ -527,7 +528,7 @@ function ReviseEventForm({
         p_void: input.void,
         p_new_qty: input.void ? null : Number(qty),
         p_new_unit: input.void ? null : unit,
-        p_new_occurred_at: input.void ? null : `${occurredAt}:00+09:00`,
+        p_new_occurred_at: timestamp,
         p_reason: reason || null,
       });
       if (error) throw error;

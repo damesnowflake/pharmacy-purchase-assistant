@@ -21,6 +21,27 @@ export function getBusinessDate(now: Date = new Date()): IsoDate {
   return KST_FORMATTER.format(now);
 }
 
+/** HTML datetime-local has no timezone; explicitly render the saved instant in Korea. */
+export function toKstDatetimeLocal(timestamp: string): string {
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) throw new Error("INVALID_OCCURRED_AT");
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(date);
+  const value = (type: string) => parts.find((p) => p.type === type)!.value;
+  return `${value("year")}-${value("month")}-${value("day")}T${value("hour")}:${value("minute")}`;
+}
+
+export function revisedEventTimestamp(original: string, input: string): string {
+  // A quantity-only correction must retain seconds and sub-millisecond precision too.
+  if (input === toKstDatetimeLocal(original)) return original;
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(input)) throw new Error("INVALID_OCCURRED_AT");
+  const timestamp = `${input}:00+09:00`;
+  if (toKstDatetimeLocal(timestamp) !== input) throw new Error("INVALID_OCCURRED_AT");
+  return timestamp;
+}
+
 export function addCalendarDays(date: IsoDate, days: number): IsoDate {
   const [y, m, d] = date.split("-").map(Number);
   const dt = new Date(Date.UTC(y, m - 1, d));
