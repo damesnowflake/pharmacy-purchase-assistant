@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabaseClient";
 import { SuppliersPanel } from "./SuppliersPanel";
+import { CapacityPanel } from "./CapacityPanel";
 
 interface ProductRow {
   id: string;
@@ -16,7 +17,7 @@ interface ProductRow {
 // IR-06 설정(관리자): 품목 MOQ·발주 단위, 거래처·최소주문금액·휴무일.
 // 품목별 거래처 발주조건(purchase_terms) 개별 편집 화면은 이후 단계에서 추가한다.
 export function SettingsPage() {
-  const [tab, setTab] = useState<"products" | "suppliers">("products");
+  const [tab, setTab] = useState<"products" | "suppliers" | "capacity">("products");
   return (
     <div>
       <div style={{ display: "flex", gap: "4px", marginBottom: "12px" }}>
@@ -26,8 +27,13 @@ export function SettingsPage() {
         <button type="button" onClick={() => setTab("suppliers")} disabled={tab === "suppliers"}>
           거래처
         </button>
+        <button type="button" onClick={() => setTab("capacity")} disabled={tab === "capacity"}>
+          용량
+        </button>
       </div>
-      {tab === "products" ? <ProductSettingsPanel /> : <SuppliersPanel />}
+      {tab === "products" && <ProductSettingsPanel />}
+      {tab === "suppliers" && <SuppliersPanel />}
+      {tab === "capacity" && <CapacityPanel />}
     </div>
   );
 }

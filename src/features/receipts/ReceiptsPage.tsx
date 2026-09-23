@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabaseClient";
+import { OcrCapture } from "./OcrCapture";
 
 interface ProductOption {
   id: string;
@@ -16,13 +17,15 @@ interface ReceiptLine {
   unit: string;
 }
 
-// IR-03 입고 등록. FR-11~14: 기기 내 OCR 촬영은 실기기 검증(D-04)이 필요해 이번 단계에서는
-// 수동 입력 경로만 완전히 구현한다. 카메라/OCR 버튼은 준비 중 상태로 남겨 완료로 표시하지 않는다.
+// IR-03 입고 등록. FR-11~14. 수동 입력과 기기 내 OCR(Tesseract.js) 촬영 입력 모두 지원한다.
+// OCR 인식 정확도는 실제 입고장 사진·iPhone 실기기로 검증되지 않았다 (D-04,
+// docs/미확인_항목.md) — 그래서 OCR 결과는 항상 이 화면의 확정 목록을 거쳐야 저장된다.
 export function ReceiptsPage() {
   const queryClient = useQueryClient();
   const [search, setSearch] = useState("");
   const [lines, setLines] = useState<ReceiptLine[]>([]);
   const [message, setMessage] = useState<string | null>(null);
+  const [showOcr, setShowOcr] = useState(false);
 
   const { data: options } = useQuery({
     queryKey: ["products", "search", search],
@@ -35,12 +38,17 @@ export function ReceiptsPage() {
     },
   });
 
+  function upsertLine(next: ReceiptLine) {
+    setLines((prev) => {
+      const existing = prev.find((l) => l.productId === next.productId && l.unit === next.unit);
+      if (!existing) return [...prev, next];
+      const merged = (Number(existing.quantity) || 0) + (Number(next.quantity) || 0);
+      return prev.map((l) => (l === existing ? { ...l, quantity: String(merged) } : l));
+    });
+  }
+
   function addLine(p: ProductOption) {
-    if (lines.some((l) => l.productId === p.id)) return;
-    setLines((prev) => [
-      ...prev,
-      { productId: p.id, label: `${p.name} ${p.spec}`.trim(), quantity: "", unit: p.base_unit },
-    ]);
+    upsertLine({ productId: p.id, label: `${p.name} ${p.spec}`.trim(), quantity: "", unit: p.base_unit });
   }
 
   function updateLine(productId: string, patch: Partial<ReceiptLine>) {
@@ -81,11 +89,14 @@ export function ReceiptsPage() {
   return (
     <div className="receipts-page">
       <section className="receipts-manual">
-        <h2>입고 등록 (수동 입력)</h2>
-        <button type="button" disabled title="iPhone 실기기 OCR 검증 후 제공 예정 (D-04)">
-          촬영으로 입력 (준비 중)
-        </button>
+        <h2>입고 등록</h2>
 
+        <button type="button" onClick={() => setShowOcr((v) => !v)}>
+          {showOcr ? "촬영 입력 닫기" : "촬영으로 입력"}
+        </button>
+        {showOcr && <OcrCapture onResolved={upsertLine} />}
+
+        <h3>수동 입력</h3>
         <label>
           품목 검색
           <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="품명으로 검색" />

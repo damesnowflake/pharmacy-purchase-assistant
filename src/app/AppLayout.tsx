@@ -1,9 +1,11 @@
 import { NavLink, Outlet } from "react-router-dom";
 import { useAuth } from "@/features/auth/AuthContext";
+import { useRealtimeInvalidate } from "@/lib/useRealtimeInvalidate";
 
 // 시스템_구조_설계.md: 상단 검색·판매자료 기준일, 중앙 표, 다크/라이트 테마.
 export function AppLayout() {
   const { profile, signOut } = useAuth();
+  useRealtimeInvalidate(Boolean(profile?.active));
 
   return (
     <div className="app-shell">

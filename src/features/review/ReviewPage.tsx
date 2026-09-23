@@ -122,6 +122,8 @@ export function ReviewPage() {
           <tr>
             <th>품목</th>
             <th>규격</th>
+            <th>기준 종류</th>
+            <th className="num">참고 잔량</th>
             <th className="num">도착일</th>
             <th className="num">추천 수량</th>
             <th>단위</th>
@@ -134,10 +136,18 @@ export function ReviewPage() {
             const warnings = Array.isArray(r.basis_json?.warning_codes)
               ? (r.basis_json.warning_codes as string[])
               : [];
+            const referenceKind = r.basis_json?.reference_kind as string | undefined;
+            const referenceValue = r.basis_json?.reference_value as number | undefined;
+            const referenceInsufficient = Boolean(r.basis_json?.reference_data_insufficient);
             return (
               <tr key={r.id}>
                 <td>{r.products?.name ?? r.product_id}</td>
                 <td>{r.products?.spec}</td>
+                <td>{referenceKind === "stock_count" ? "실사" : referenceKind === "last_receipt" ? "최근 입고" : "-"}</td>
+                <td className="num">
+                  {referenceValue ?? "-"}
+                  {referenceInsufficient && <span className="warning-badge" style={{ marginLeft: 4 }}>자료 부족</span>}
+                </td>
                 <td className="num">{r.arrival_date}</td>
                 <td className="num">
                   {isAdmin ? (
