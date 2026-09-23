@@ -1,8 +1,11 @@
 import { useState, type FormEvent } from "react";
+import { Navigate } from "react-router-dom";
 import { supabase } from "@/lib/supabaseClient";
+import { useAuth } from "./AuthContext";
 
 // IR-01: 사전 발급 로그인 식별자·비밀번호. 신규 가입 버튼 없음.
 export function LoginPage() {
+  const { session, loading } = useAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -22,6 +25,9 @@ export function LoginPage() {
     }
     setSubmitting(false);
   }
+
+  if (loading) return <div className="center-message">불러오는 중...</div>;
+  if (session) return <Navigate to="/review" replace />;
 
   return (
     <div className="login-screen">
