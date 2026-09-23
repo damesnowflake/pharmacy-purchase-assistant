@@ -241,7 +241,13 @@ function RecommendationTableRow({
       if (e.message.includes("VERSION_CONFLICT") || e.message.includes("INVALID") || e.message.includes("RECOMMENDATION")) {
         clearPending();
       }
-      onMessage(`발주 완료 처리 실패: ${e.message}`);
+      if (e.message.includes("VERSION_CONFLICT")) {
+        setOrderFormOpen(false);
+        onChanged();
+        onMessage("추천이 변경되었습니다. 최신 수량과 근거를 확인한 뒤 다시 발주 완료 처리해 주세요.");
+      } else {
+        onMessage(`발주 완료 처리 실패: ${e.message}`);
+      }
     },
   });
 

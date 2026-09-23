@@ -14,6 +14,7 @@
 
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { Matrix, SVD } from "npm:ml-matrix@6";
+import { businessDate, hasHolidayCoverage } from "./holidayCoverage.ts";
 
 const BATCH_SIZE = 20;
 const COEFFICIENT_COUNT = 8;
@@ -149,7 +150,7 @@ async function computeArrivalReference(
   dailyMap: Map<string, number>,
   predict: (d: IsoDate) => number,
 ): Promise<ReferenceResult | null> {
-  const { data: lastCountRows } = await supabase
+  const { data: lastCountRows, error: countError } = await supabase
     .from("quantity_events")
     .select("occurred_at, qty_base, day_boundary")
     .eq("product_id", productId)
@@ -157,10 +158,11 @@ async function computeArrivalReference(
     .eq("active", true)
     .order("occurred_at", { ascending: false })
     .limit(1);
+  if (countError) throw countError;
   const lastCount = lastCountRows?.[0];
 
   if (lastCount) {
-    const countDate = (lastCount.occurred_at as string).slice(0, 10);
+    const countDate = businessDate(new Date(lastCount.occurred_at));
     const isEndOfDay = lastCount.day_boundary === "end_of_day";
 
     let midDayCorrection = 0;
@@ -170,13 +172,14 @@ async function computeArrivalReference(
       midDayCorrectionApplied = true;
     }
 
-    const { data: afterEvents } = await supabase
+    const { data: afterEvents, error: eventsError } = await supabase
       .from("quantity_events")
       .select("kind, qty_base")
       .eq("product_id", productId)
       .eq("active", true)
       .in("kind", ["receipt", "stock_adjustment"])
       .gt("occurred_at", lastCount.occurred_at);
+    if (eventsError) throw eventsError;
     const receiptsAfter = (afterEvents ?? [])
       .filter((e: { kind: string }) => e.kind === "receipt")
       .reduce((a: number, e: { qty_base: number }) => a + e.qty_base, 0);
@@ -208,7 +211,7 @@ async function computeArrivalReference(
     };
   }
 
-  const { data: lastReceiptRows } = await supabase
+  const { data: lastReceiptRows, error: receiptError } = await supabase
     .from("quantity_events")
     .select("occurred_at, qty_base")
     .eq("product_id", productId)
@@ -216,10 +219,11 @@ async function computeArrivalReference(
     .eq("active", true)
     .order("occurred_at", { ascending: false })
     .limit(1);
+  if (receiptError) throw receiptError;
   if (!lastReceiptRows || lastReceiptRows.length === 0) return null;
 
-  const B = (lastReceiptRows[0].occurred_at as string).slice(0, 10);
-  const { data: receiptsOnB } = await supabase
+  const B = businessDate(new Date(lastReceiptRows[0].occurred_at));
+  const { data: receiptsOnB, error: receiptDayError } = await supabase
     .from("quantity_events")
     .select("qty_base")
     .eq("product_id", productId)
@@ -227,6 +231,7 @@ async function computeArrivalReference(
     .eq("active", true)
     .gte("occurred_at", `${B}T00:00:00+09:00`)
     .lt("occurred_at", `${addDays(B, 1)}T00:00:00+09:00`);
+  if (receiptDayError) throw receiptDayError;
   const Q = (receiptsOnB ?? []).reduce((a: number, r: { qty_base: number }) => a + r.qty_base, 0);
 
   const actualRange = B <= today ? dateRange(B, today) : [];
@@ -259,210 +264,118 @@ Deno.serve(async (_req) => {
     return new Response("MISSING_SUPABASE_ENV", { status: 500 });
   }
   const supabase = createClient(supabaseUrl, serviceRoleKey);
-
-  // 대기 중인 작업을 먼저 "처리 중"으로 표시해 선점(lease)한다. 다른 동시 실행이 같은 품목을
-  // 다시 집어가지 않도록 하기 위함이다 (시스템_구조_설계.md "중복 실행 잠금").
-  const leaseUntil = new Date(Date.now() + 5 * 60_000).toISOString();
-  const { data: candidateRows, error: candidateError } = await supabase
-    .from("recompute_queue")
-    .select("product_id, required_revision, need_training, attempts")
-    .in("status", ["pending"])
-    .limit(BATCH_SIZE);
-  if (candidateError) {
-    return new Response(`QUEUE_READ_ERROR: ${candidateError.message}`, { status: 500 });
-  }
-  // 오래 멈춘(리스 만료) processing 항목도 되찾아온다.
-  const { data: staleRows } = await supabase
-    .from("recompute_queue")
-    .select("product_id, required_revision, need_training, attempts")
-    .eq("status", "processing")
-    .lt("lease_until", new Date().toISOString())
-    .limit(BATCH_SIZE);
-
-  const queueRows = [...(candidateRows ?? []), ...(staleRows ?? [])].slice(0, BATCH_SIZE);
-  if (queueRows.length === 0) {
-    return new Response(JSON.stringify({ processed: 0 }), { headers: { "content-type": "application/json" } });
-  }
-
-  const claimedIds = queueRows.map((r) => r.product_id);
-  await supabase
-    .from("recompute_queue")
-    .update({ status: "processing", lease_until: leaseUntil })
-    .in("product_id", claimedIds);
-
-  const today = new Date().toISOString().slice(0, 10);
+  const today = businessDate();
   const windowStart = addDays(today, -(TRAINING_WINDOW_DAYS - 1));
-
-  const { data: holidayRows } = await supabase
-    .from("holiday_dates")
-    .select("holiday_date")
-    .gte("holiday_date", today)
-    .lte("holiday_date", addDays(today, 30));
+  // Read prerequisites before taking leases. Failed reads must never look like empty data.
+  const { data: holidayRows, error: holidayError } = await supabase
+    .from("holiday_dates").select("holiday_date")
+    .gte("holiday_date", today).lte("holiday_date", addDays(today, 366));
+  const { data: coverageRows, error: coverageError } = await supabase
+    .from("holiday_sync_runs").select("coverage_start, coverage_end")
+    .in("status", ["success", "empty_confirmed"])
+    .gte("coverage_end", today).lte("coverage_start", addDays(today, 366));
+  if (holidayError || coverageError) {
+    return new Response("HOLIDAY_READ_ERROR", { status: 500 });
+  }
   const holidaySet = new Set((holidayRows ?? []).map((h) => h.holiday_date as string));
-  const { data: coverageRows } = await supabase
-    .from("holiday_sync_runs")
-    .select("coverage_start, coverage_end")
-    .eq("status", "success")
-    .order("fetched_at", { ascending: false })
-    .limit(1);
-  const coverage = coverageRows?.[0];
-  const isCovered = (d: IsoDate) =>
-    !!coverage && d >= (coverage.coverage_start as string) && d <= (coverage.coverage_end as string);
+  const isCovered = (d: IsoDate) => hasHolidayCoverage(d, coverageRows ?? []);
+
+  const { data: queueRows, error: claimError } = await supabase.rpc("claim_recompute_batch", {
+    p_batch_size: BATCH_SIZE, p_lease_seconds: 300,
+  });
+  if (claimError) return new Response("QUEUE_CLAIM_ERROR", { status: 500 });
 
   const results: Array<{ product_id: string; status: string }> = [];
-
-  for (const row of queueRows) {
+  for (const row of queueRows ?? []) {
     const productId = row.product_id as string;
+    const finish = async (status: string, result: Record<string, unknown>, error: string | null = null) => {
+      const { data, error: rpcError } = await supabase.rpc("finish_recompute_item", {
+        p_product_id: productId, p_lease_token: row.lease_token,
+        p_required_revision: row.required_revision, p_status: status,
+        p_result: result, p_error: error,
+      });
+      if (rpcError) throw rpcError;
+      return data as string;
+    };
     try {
-      const { data: product } = await supabase
-        .from("products")
+      const { data: product, error: productError } = await supabase.from("products")
         .select("id, observed_from, default_moq, default_order_step")
-        .eq("id", productId)
-        .single();
+        .eq("id", productId).single();
+      if (productError) throw productError;
       if (!product) throw new Error("PRODUCT_NOT_FOUND");
 
-      const { data: dailyRows } = await supabase
-        .from("sales_daily")
-        .select("sale_date, net_qty")
-        .eq("product_id", productId)
-        .gte("sale_date", windowStart)
-        .lte("sale_date", today);
-      const { data: coverageDaily } = await supabase
-        .from("sales_coverage")
-        .select("sale_date, status")
-        .gte("sale_date", windowStart)
-        .lte("sale_date", today);
-
+      const { data: dailyRows, error: dailyError } = await supabase.from("sales_daily")
+        .select("sale_date, net_qty").eq("product_id", productId)
+        .gte("sale_date", windowStart).lte("sale_date", today);
+      const { data: coverageDaily, error: dailyCoverageError } = await supabase.from("sales_coverage")
+        .select("sale_date, status").gte("sale_date", windowStart).lte("sale_date", today);
+      if (dailyError) throw dailyError;
+      if (dailyCoverageError) throw dailyCoverageError;
       const dailyMap = new Map((dailyRows ?? []).map((r) => [r.sale_date as string, r.net_qty as number]));
       const coverageMap = new Map((coverageDaily ?? []).map((r) => [r.sale_date as string, r.status as string]));
-
       const observations: Observation[] = dateRange(windowStart, today).map((d) => {
-        if (d < (product.observed_from as string)) return { date: d, status: "not_observed" };
+        if (d < product.observed_from) return { date: d, status: "not_observed" };
         if (coverageMap.get(d) !== "complete") return { date: d, status: "missing" };
         return { date: d, status: "observed", netQty: dailyMap.get(d) ?? 0 };
       });
-
       const model = trainModel(observations);
-
-      if (model.status === "fitted") {
-        await supabase.from("forecast_models").upsert({
-          product_id: productId,
-          model_version: "ols-v1",
-          training_start: model.trainingStart,
-          training_end: model.trainingEnd,
-          n_observed: model.nObserved,
-          n_missing: model.nMissing,
-          coefficients: model.coefficients,
-          warning_codes: model.warningCodes,
-          input_revision: row.required_revision,
-          computed_at: new Date().toISOString(),
-        });
-
-        // 참고값(inventory_anchors) 갱신과 추천 생성은 도착일을 함께 필요로 하므로
-        // 공휴일 자료가 확보된 경우에만 수행한다. 공휴일 자료가 없다고 참고값 계산 자체를
-        // 영구히 건너뛰지는 않는다 — 다음 배치 실행 때 공휴일 캐시가 채워지면 갱신된다.
-        if (isCovered(today)) {
-          const arrival = calculateArrivalDate(today, isCovered, (d) => holidaySet.has(d));
-          if (arrival) {
-            const reference = await computeArrivalReference(
-              supabase,
-              productId,
-              today,
-              arrival,
-              dailyMap,
-              model.predict,
-            );
-
-            if (reference) {
-              await supabase.from("inventory_anchors").upsert({
-                product_id: productId,
-                kind: reference.anchorKind,
-                anchor_date: reference.anchorDate,
-                sales_start_date: reference.anchorDate,
-                qty_base: reference.anchorQty,
-                sales_before_start: 0,
-                estimated_first_day_sales: reference.midDayCorrectionApplied
-                  ? model.predict(reference.anchorDate)
-                  : null,
-                model_version: "ols-v1",
-                revision: 1,
-                updated_at: new Date().toISOString(),
-              });
-            }
-
-            if (reference && reference.value <= 0 && product.default_moq && product.default_order_step) {
-              const sevenDay = dateRange(arrival, addDays(arrival, 6)).reduce(
-                (acc, d) => acc + model.predict(d),
-                0,
-              );
-              const M = product.default_moq as number;
-              const U = product.default_order_step as number;
-              const target = Math.max(M, sevenDay);
-              const qty = U * Math.ceil(Math.round((target / U) * 1e6) / 1e6);
-              const basis = {
-                reference_kind: reference.anchorKind,
-                reference_value: reference.value,
-                reference_data_insufficient: reference.dataInsufficient,
-                seven_day_demand: sevenDay,
-                warning_codes: model.warningCodes,
-                model_version: "ols-v1",
+      // Nothing is written until the server validates the lease AND revision in one transaction.
+      const result: Record<string, unknown> = {};
+      let reason: string | null = null;
+      if (model.status !== "fitted") {
+        reason = "insufficient_history";
+      } else {
+        result.model = {
+          model_version: "ols-v1", training_start: model.trainingStart, training_end: model.trainingEnd,
+          n_observed: model.nObserved, n_missing: model.nMissing,
+          coefficients: model.coefficients, warning_codes: model.warningCodes,
+        };
+        const arrival = isCovered(today)
+          ? calculateArrivalDate(today, isCovered, (d) => holidaySet.has(d)) : null;
+        if (!arrival) {
+          reason = "holiday_missing";
+        } else {
+          const reference = await computeArrivalReference(supabase, productId, today, arrival, dailyMap, model.predict);
+          if (!reference) {
+            reason = "reference_missing";
+          } else {
+            result.anchor = {
+              kind: reference.anchorKind, anchor_date: reference.anchorDate,
+              qty_base: reference.anchorQty,
+              estimated_first_day_sales: reference.midDayCorrectionApplied
+                ? model.predict(reference.anchorDate) : null,
+            };
+            if (!product.default_moq) reason = "moq_missing";
+            else if (!product.default_order_step) reason = "unit_missing";
+            else if (reference.value <= 0) {
+              const sevenDay = dateRange(arrival, addDays(arrival, 6)).reduce((sum, d) => sum + model.predict(d), 0);
+              const target = Math.max(product.default_moq, sevenDay);
+              const step = product.default_order_step as number;
+              result.recommendation = {
+                arrival_date: arrival,
+                recommended_qty: step * Math.ceil(Math.round(target / step * 1e6) / 1e6),
+                basis_json: {
+                  reference_kind: reference.anchorKind, reference_value: reference.value,
+                  reference_data_insufficient: reference.dataInsufficient,
+                  seven_day_demand: sevenDay, warning_codes: model.warningCodes, model_version: "ols-v1",
+                },
               };
-
-              // recommendations는 "품목별 미종결 추천 최대 1개"라는 부분 유니크 인덱스
-              // (status <> 'received')만 가지고 있어 supabase-js의 일반 upsert(onConflict)로는
-              // 조건부 인덱스를 매칭시킬 수 없다. 열려 있는 추천이 있으면 갱신, 없으면 새로 만든다.
-              const { data: openRec } = await supabase
-                .from("recommendations")
-                .select("id, status")
-                .eq("product_id", productId)
-                .neq("status", "received")
-                .maybeSingle();
-
-              if (openRec && openRec.status === "review") {
-                await supabase
-                  .from("recommendations")
-                  .update({
-                    arrival_date: arrival,
-                    recommended_qty: qty,
-                    basis_json: basis,
-                    input_revision: row.required_revision,
-                  })
-                  .eq("id", openRec.id);
-              } else if (!openRec) {
-                await supabase.from("recommendations").insert({
-                  product_id: productId,
-                  status: "review",
-                  decision: "active",
-                  arrival_date: arrival,
-                  recommended_qty: qty,
-                  basis_json: basis,
-                  input_revision: row.required_revision,
-                });
-              }
-              // openRec.status === 'waiting'인 경우는 FR-28대로 기존 발주를 재생성하지 않는다.
             }
           }
         }
       }
-
-      await supabase
-        .from("recompute_queue")
-        .update({ status: "done", updated_at: new Date().toISOString() })
-        .eq("product_id", productId);
-      results.push({ product_id: productId, status: "done" });
+      result.calc_reason = reason;
+      results.push({ product_id: productId, status: await finish(reason ? "blocked" : "done", result) });
     } catch (e) {
-      await supabase
-        .from("recompute_queue")
-        .update({
-          status: "error",
-          last_error: String(e),
-          attempts: ((row as { attempts?: number }).attempts ?? 0) + 1,
-        })
-        .eq("product_id", productId);
-      results.push({ product_id: productId, status: "error" });
+      try {
+        results.push({ product_id: productId, status: await finish("error", {}, String(e)) });
+      } catch (finishError) {
+        // Leave the lease intact: its expiry permits recovery instead of losing the job.
+        console.error("QUEUE_FINISH_ERROR", productId, String(finishError));
+        results.push({ product_id: productId, status: "error" });
+      }
     }
   }
-
   return new Response(JSON.stringify({ processed: results.length, results }), {
     headers: { "content-type": "application/json" },
   });
