@@ -12,6 +12,7 @@
 //   HOLIDAY_API_SERVICE_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY(Supabase가 자동 주입)
 
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { businessDate } from "../forecast-batch/holidayCoverage.ts";
 
 const HOLIDAY_API_BASE =
   "https://apis.data.go.kr/B090041/openapi/service/SpcdeInfoService/getHoliDeInfo";
@@ -75,7 +76,9 @@ Deno.serve(async (_req) => {
   }
 
   const supabase = createClient(supabaseUrl, serviceRoleKey);
-  const currentYear = new Date().getUTCFullYear();
+  // UTC 기준 연도를 쓰면 한국시간 자정 무렵(예: UTC 12/31 15:05 = KST 1/1 00:05) 새해가 됐는데도
+  // 여전히 작년 기준으로 동기화해 새해 첫날 공휴일 확보가 하루 늦어질 수 있다(시나리오 4).
+  const currentYear = Number(businessDate().slice(0, 4));
   const years = [currentYear, currentYear + 1]; // 현재/다음 연도 매일 갱신 (IR-19)
 
   const results: Array<{ year: number; status: string; error?: string }> = [];

@@ -234,6 +234,7 @@ create or replace function list_movement_history(
   revises_event_id uuid,
   created_by uuid,
   created_by_name text,
+  version bigint,
   total_count bigint
 )
 language plpgsql
@@ -252,7 +253,8 @@ begin
       qe.id as event_id, qe.product_id, p.name as product_name, p.spec as product_spec,
       p.base_unit, qe.kind, qe.occurred_at, qe.input_qty, qe.input_unit, qe.qty_base,
       qe.excess_qty_base, qe.supplier_id, s.name as supplier_name, qe.recommendation_id,
-      r.closed_reason, qe.active, qe.revises_event_id, qe.created_by, pr.display_name as created_by_name
+      r.closed_reason, qe.active, qe.revises_event_id, qe.created_by, pr.display_name as created_by_name,
+      qe.version
     from quantity_events qe
     join products p on p.id = qe.product_id
     left join suppliers s on s.id = qe.supplier_id
