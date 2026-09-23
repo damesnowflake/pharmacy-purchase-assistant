@@ -9,6 +9,7 @@
 // SUPABASE_SERVICE_ROLE_KEY는 절대 커밋되는 파일에 넣지 않고 셸 환경변수로만 전달한다. (NFR-07)
 
 import { createClient } from "@supabase/supabase-js";
+import WebSocket from "ws";
 
 function parseArgs(argv: string[]): Record<string, string | boolean> {
   const out: Record<string, string | boolean> = {};
@@ -46,7 +47,15 @@ async function main() {
     process.exit(1);
   }
 
-  const admin = createClient(url, serviceKey, { auth: { autoRefreshToken: false, persistSession: false } });
+  // Node 20에는 전역 WebSocket이 없어(22부터 기본 제공) supabase-js가 내부적으로 만드는
+  // Realtime 클라이언트 초기화가 즉시 예외를 던진다. 이 스크립트는 Realtime을 쓰지 않지만
+  // createClient가 항상 만들어 보므로 ws 패키지를 명시적으로 넘겨 초기화만 통과시킨다.
+  const admin = createClient(url, serviceKey, {
+    auth: { autoRefreshToken: false, persistSession: false },
+    // ws 패키지의 생성자 타입이 브라우저 WebSocket과 완전히 일치하지 않아 캐스트가 필요하다.
+    // 런타임 동작은 Supabase 에러 메시지가 안내하는 표준 해결 방법 그대로다.
+    realtime: { transport: WebSocket as never },
+  });
 
   if (deactivate) {
     const { data: users, error: listError } = await admin.auth.admin.listUsers();
