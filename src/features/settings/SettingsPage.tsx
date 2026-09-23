@@ -3,6 +3,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabaseClient";
 import { SuppliersPanel } from "./SuppliersPanel";
 import { CapacityPanel } from "./CapacityPanel";
+import { ProductSearchBox } from "@/features/products/ProductSearchBox";
+import { ProductRegisterForm } from "@/features/products/ProductRegisterForm";
+import type { ProductSearchResult } from "@/lib/useProductSearch";
 
 interface ProductRow {
   id: string;
@@ -14,7 +17,7 @@ interface ProductRow {
   version: number;
 }
 
-// IR-06 설정(관리자): 품목 MOQ·발주 단위, 거래처·최소주문금액·휴무일.
+// IR-06 설정(관리자): 상품 등록·검색·MOQ·발주 단위, 거래처·휴무일.
 // 품목별 거래처 발주조건(purchase_terms) 개별 편집 화면은 이후 단계에서 추가한다.
 export function SettingsPage() {
   const [tab, setTab] = useState<"products" | "suppliers" | "capacity">("products");
@@ -42,6 +45,8 @@ function ProductSettingsPanel() {
   const queryClient = useQueryClient();
   const [edits, setEdits] = useState<Record<string, { moq: string; step: string }>>({});
   const [message, setMessage] = useState<string | null>(null);
+  const [showRegister, setShowRegister] = useState(false);
+  const [highlightId, setHighlightId] = useState<string | null>(null);
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["products", "settings"],
@@ -55,6 +60,13 @@ function ProductSettingsPanel() {
       return data as ProductRow[];
     },
   });
+
+  function handleRegistered(p: ProductSearchResult) {
+    setMessage(`${p.name} ${p.spec} 등록(또는 기존 선택) 완료.`);
+    setShowRegister(false);
+    setHighlightId(p.product_id);
+    queryClient.invalidateQueries({ queryKey: ["products"] });
+  }
 
   const save = useMutation({
     mutationFn: async (p: ProductRow) => {
@@ -81,8 +93,21 @@ function ProductSettingsPanel() {
 
   return (
     <div>
-      <h2>품목 설정 (MOQ·발주 단위)</h2>
+      <h2>품목 설정</h2>
       {message && <p className="form-message">{message}</p>}
+
+      <ProductSearchBox
+        allowRegisterNew={false}
+        placeholder="품목 검색 (아래 표에서 강조 표시)"
+        onSelect={(p) => setHighlightId(p.product_id)}
+      />
+
+      <button type="button" onClick={() => setShowRegister((v) => !v)}>
+        {showRegister ? "새 상품 등록 닫기" : "새 상품 등록"}
+      </button>
+      {showRegister && <ProductRegisterForm onRegistered={handleRegistered} onCancel={() => setShowRegister(false)} />}
+
+      <h3>MOQ·발주 단위</h3>
       <table className="dense-table">
         <thead>
           <tr>
@@ -95,7 +120,7 @@ function ProductSettingsPanel() {
         </thead>
         <tbody>
           {(data ?? []).map((p) => (
-            <tr key={p.id}>
+            <tr key={p.id} style={highlightId === p.id ? { outline: "2px solid var(--accent)" } : undefined}>
               <td>{p.name}</td>
               <td>{p.spec}</td>
               <td className="num">

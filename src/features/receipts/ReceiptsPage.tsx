@@ -1,14 +1,9 @@
 import { useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabaseClient";
 import { OcrCapture } from "./OcrCapture";
-
-interface ProductOption {
-  id: string;
-  name: string;
-  spec: string;
-  base_unit: string;
-}
+import { ProductSearchBox } from "@/features/products/ProductSearchBox";
+import type { ProductSearchResult } from "@/lib/useProductSearch";
 
 interface ReceiptLine {
   productId: string;
@@ -20,23 +15,15 @@ interface ReceiptLine {
 // IR-03 입고 등록. FR-11~14. 수동 입력과 기기 내 OCR(Tesseract.js) 촬영 입력 모두 지원한다.
 // OCR 인식 정확도는 실제 입고장 사진·iPhone 실기기로 검증되지 않았다 (D-04,
 // docs/미확인_항목.md) — 그래서 OCR 결과는 항상 이 화면의 확정 목록을 거쳐야 저장된다.
+//
+// 상품 검색에서 결과가 없으면 같은 화면에서 새 상품을 등록할 수 있다(ProductSearchBox).
+// 등록이 끝나면 그 상품이 자동으로 입고 행에 추가되고, 이미 입력해 둔 다른 행·수량은 그대로
+// 유지된다(별도 상태를 건드리지 않고 lines 배열에 더하기만 함).
 export function ReceiptsPage() {
   const queryClient = useQueryClient();
-  const [search, setSearch] = useState("");
   const [lines, setLines] = useState<ReceiptLine[]>([]);
   const [message, setMessage] = useState<string | null>(null);
   const [showOcr, setShowOcr] = useState(false);
-
-  const { data: options } = useQuery({
-    queryKey: ["products", "search", search],
-    queryFn: async () => {
-      let query = supabase.from("products").select("id, name, spec, base_unit").eq("active", true).limit(20);
-      if (search.trim()) query = query.ilike("name", `%${search.trim()}%`);
-      const { data, error } = await query;
-      if (error) throw error;
-      return data as ProductOption[];
-    },
-  });
 
   function upsertLine(next: ReceiptLine) {
     setLines((prev) => {
@@ -47,8 +34,8 @@ export function ReceiptsPage() {
     });
   }
 
-  function addLine(p: ProductOption) {
-    upsertLine({ productId: p.id, label: `${p.name} ${p.spec}`.trim(), quantity: "", unit: p.base_unit });
+  function addProduct(p: ProductSearchResult) {
+    upsertLine({ productId: p.product_id, label: `${p.name} ${p.spec}`.trim(), quantity: "", unit: p.base_unit });
   }
 
   function updateLine(productId: string, patch: Partial<ReceiptLine>) {
@@ -97,21 +84,7 @@ export function ReceiptsPage() {
         {showOcr && <OcrCapture onResolved={upsertLine} />}
 
         <h3>수동 입력</h3>
-        <label>
-          품목 검색
-          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="품명으로 검색" />
-        </label>
-        {options && options.length > 0 && (
-          <ul className="search-results">
-            {options.map((p) => (
-              <li key={p.id}>
-                <button type="button" onClick={() => addLine(p)}>
-                  {p.name} {p.spec} 추가
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
+        <ProductSearchBox onSelect={addProduct} placeholder="품명·규격·별칭·바코드로 검색" />
 
         {lines.length > 0 && (
           <table className="dense-table">

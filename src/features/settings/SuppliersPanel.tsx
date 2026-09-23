@@ -5,8 +5,6 @@ import { supabase } from "@/lib/supabaseClient";
 interface SupplierRow {
   id: string;
   name: string;
-  minimum_drug_amount: number;
-  minimum_other_amount: number;
   promotion_note: string | null;
 }
 
@@ -16,11 +14,13 @@ interface ClosedDateRow {
   reason: string | null;
 }
 
-// FR-18~19: 거래처별 최소주문금액·프로모션 메모, 거래처 자체 휴무일.
+// FR-18~19(갱신): 거래처 기본정보·프로모션 메모, 거래처 자체 휴무일.
+// 최소구매금액 입력·기본값·경고는 제거했다 — 구매 담당자가 실제 주문 시 직접 판단하므로
+// 시스템에서 요구하지 않는다(최종 검수 보완 사항, docs/미확인_항목.md 참고).
 export function SuppliersPanel() {
   const queryClient = useQueryClient();
   const [message, setMessage] = useState<string | null>(null);
-  const [newSupplier, setNewSupplier] = useState({ name: "", drug: "200000", other: "50000", note: "" });
+  const [newSupplier, setNewSupplier] = useState({ name: "", note: "" });
   const [closedDateForm, setClosedDateForm] = useState<Record<string, { date: string; reason: string }>>({});
 
   const { data: suppliers } = useQuery({
@@ -28,7 +28,7 @@ export function SuppliersPanel() {
     queryFn: async () => {
       const { data, error } = await supabase
         .from("suppliers")
-        .select("id, name, minimum_drug_amount, minimum_other_amount, promotion_note")
+        .select("id, name, promotion_note")
         .eq("active", true)
         .order("name");
       if (error) throw error;
@@ -53,15 +53,13 @@ export function SuppliersPanel() {
       const { error } = await supabase.rpc("save_supplier", {
         p_id: null,
         p_name: newSupplier.name,
-        p_minimum_drug_amount: Number(newSupplier.drug),
-        p_minimum_other_amount: Number(newSupplier.other),
         p_promotion_note: newSupplier.note || null,
       });
       if (error) throw error;
     },
     onSuccess: () => {
       setMessage("거래처가 저장되었습니다.");
-      setNewSupplier({ name: "", drug: "200000", other: "50000", note: "" });
+      setNewSupplier({ name: "", note: "" });
       queryClient.invalidateQueries({ queryKey: ["suppliers"] });
     },
     onError: (e: Error) => setMessage(`저장 실패: ${e.message}`),
@@ -106,8 +104,6 @@ export function SuppliersPanel() {
         <thead>
           <tr>
             <th>이름</th>
-            <th className="num">의약품 최소금액</th>
-            <th className="num">의약외품 최소금액</th>
             <th>프로모션 메모</th>
             <th>휴무일 추가</th>
           </tr>
@@ -116,8 +112,6 @@ export function SuppliersPanel() {
           {(suppliers ?? []).map((s) => (
             <tr key={s.id}>
               <td>{s.name}</td>
-              <td className="num">{s.minimum_drug_amount.toLocaleString()}</td>
-              <td className="num">{s.minimum_other_amount.toLocaleString()}</td>
               <td>{s.promotion_note ?? "-"}</td>
               <td>
                 <input
@@ -152,22 +146,6 @@ export function SuppliersPanel() {
       <label>
         이름
         <input value={newSupplier.name} onChange={(e) => setNewSupplier((p) => ({ ...p, name: e.target.value }))} />
-      </label>
-      <label>
-        의약품 최소주문금액
-        <input
-          type="number"
-          value={newSupplier.drug}
-          onChange={(e) => setNewSupplier((p) => ({ ...p, drug: e.target.value }))}
-        />
-      </label>
-      <label>
-        의약외품 최소주문금액
-        <input
-          type="number"
-          value={newSupplier.other}
-          onChange={(e) => setNewSupplier((p) => ({ ...p, other: e.target.value }))}
-        />
       </label>
       <label>
         프로모션 메모
