@@ -4,7 +4,6 @@ import { supabase } from "@/lib/supabaseClient";
 import {
   parseFlexibleDate,
   parseFlexibleQuantity,
-  normalizeAliasText,
   findDateGaps,
   classifySalesRows,
   decodeCsvBytes,
@@ -16,6 +15,9 @@ import {
   type CatposParseError,
 } from "@/lib/catposTalkFileParser";
 import type { IsoDate } from "@/lib/date";
+import { matchSalesItems, type MatchResult } from "@/lib/productMatching";
+import { ProductSearchBox } from "@/features/products/ProductSearchBox";
+import type { ProductSearchResult } from "@/lib/useProductSearch";
 
 // IR-02 판매 업로드. FR-05~10.
 // 열이 CatPOS "톡파일" 판매내역 구조(거래 헤더 + 상품상세 텍스트 행, catposTalkFileParser.ts
@@ -37,12 +39,6 @@ type Step = "pick" | "map" | "match" | "preview" | "done";
 
 interface SheetRow {
   [column: string]: unknown;
-}
-
-interface ProductOption {
-  id: string;
-  name: string;
-  spec: string;
 }
 
 interface ParsedRow {
@@ -86,7 +82,10 @@ export function SalesUploadPage() {
   const [catposErrors, setCatposErrors] = useState<CatposParseError[]>([]);
   const [catposErrorsAcknowledged, setCatposErrorsAcknowledged] = useState(false);
   const [itemMatches, setItemMatches] = useState<Record<string, string | "skip">>({});
-  const [productOptions, setProductOptions] = useState<ProductOption[]>([]);
+  const [matchInfo, setMatchInfo] = useState<Record<string, MatchResult>>({});
+  const [matchLoading, setMatchLoading] = useState(false);
+  const [pickerOpenFor, setPickerOpenFor] = useState<string | null>(null);
+  const [saveAliasFor, setSaveAliasFor] = useState<Record<string, boolean>>({});
   const [rowOverrides, setRowOverrides] = useState<Record<number, RowOverride>>({});
   const [gapsAcknowledged, setGapsAcknowledged] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -124,8 +123,10 @@ export function SalesUploadPage() {
     setRowOverrides({});
     setGapsAcknowledged(false);
     setCatposErrorsAcknowledged(false);
-    setProductOptions([]);
+    setMatchInfo({});
     setItemMatches({});
+    setSaveAliasFor({});
+    setPickerOpenFor(null);
 
     const catposColumns = detectCatposTalkFileColumns(headerRow);
     if (catposColumns) {
@@ -207,45 +208,57 @@ export function SalesUploadPage() {
     [contentRows],
   );
 
-  // match 단계에 처음 들어올 때 품목 목록을 불러와 별칭으로 자동 매칭한다. 일반 가져오기(열
-  // 매핑 후 버튼 클릭)와 CatPOS 자동 인식(파일 선택 즉시 match로 건너뜀) 양쪽 모두 이 단계에
-  // 진입하는 시점의 distinctItems를 기준으로 하므로, 진입 경로와 무관하게 항상 최신값을 쓴다.
+  // match 단계에 처음 들어올 때 품목명마다 search_products로 후보를 조회한다(이름·규격·별칭·
+  // POS코드/바코드 전부 대상). 상품 전체를 한 번에 내려받지 않으므로 상품이 몇천 개여도
+  // 응답 제한에 걸리지 않는다. 이름이 정확히 일치하는 후보가 하나뿐일 때만 자동 연결하고,
+  // 같은 이름의 서로 다른 규격이 여러 개면 자동으로 하나를 골라 덮어쓰지 않는다(시나리오 6).
   useEffect(() => {
-    if (step !== "match" || productOptions.length > 0) return;
+    if (step !== "match" || distinctItems.length === 0 || Object.keys(matchInfo).length > 0) return;
     let cancelled = false;
     (async () => {
       setMessage(null);
-      const { data, error } = await supabase
-        .from("products")
-        .select("id, name, spec, product_aliases(alias, normalized_alias)")
-        .eq("active", true);
-      if (cancelled) return;
-      if (error) {
-        setMessage(`품목 목록 조회 실패: ${error.message}`);
-        return;
-      }
-      const options = (data ?? []).map((p) => ({ id: p.id as string, name: p.name as string, spec: p.spec as string }));
-      setProductOptions(options);
-
-      const aliasIndex = new Map<string, string>();
-      for (const p of data ?? []) {
-        aliasIndex.set(normalizeAliasText(p.name as string), p.id as string);
-        for (const a of (p.product_aliases ?? []) as { normalized_alias: string }[]) {
-          aliasIndex.set(a.normalized_alias, p.id as string);
+      setMatchLoading(true);
+      try {
+        const found = await matchSalesItems(distinctItems);
+        if (cancelled) return;
+        const infoObj: Record<string, MatchResult> = {};
+        const initialMatches: Record<string, string | "skip"> = {};
+        for (const [item, info] of found.entries()) {
+          infoObj[item] = info;
+          if (info.autoMatchedId) initialMatches[item] = info.autoMatchedId;
         }
+        setMatchInfo(infoObj);
+        setItemMatches((prev) => ({ ...initialMatches, ...prev }));
+      } catch (e) {
+        if (!cancelled) setMessage(`품목 검색 실패: ${(e as Error).message}`);
+      } finally {
+        if (!cancelled) setMatchLoading(false);
       }
-      const initial: Record<string, string | "skip"> = {};
-      for (const item of distinctItems) {
-        const found = aliasIndex.get(normalizeAliasText(item));
-        if (found) initial[item] = found;
-      }
-      setItemMatches(initial);
     })();
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step, productOptions.length]);
+  }, [step, distinctItems.length]);
+
+  const linkAlias = useMutation({
+    mutationFn: async (input: { productId: string; alias: string }) => {
+      const { error } = await supabase.rpc("add_product_alias", {
+        p_product_id: input.productId,
+        p_alias: input.alias,
+        p_source: "sales_upload",
+      });
+      if (error) throw error;
+    },
+  });
+
+  function chooseMatch(item: string, productId: string) {
+    setItemMatches((prev) => ({ ...prev, [item]: productId }));
+    setPickerOpenFor(null);
+    if (saveAliasFor[item] !== false) {
+      linkAlias.mutate({ productId, alias: item });
+    }
+  }
 
   // 품목명이 있는데 아직 아무것도 선택하지 않은 경우만 "미연결"로 본다. 품목명이 비어 있는
   // 행(날짜·수량만 있는 이상 행)은 품목 매칭 단계에서 처리할 대상이 아니라, 아래 행별 문제
@@ -438,7 +451,10 @@ export function SalesUploadPage() {
               </label>
             </div>
           )}
-          <p>서로 다른 품목명 {distinctItems.length}개 중 미연결 {unresolvedCount}개</p>
+          <p>
+            서로 다른 품목명 {distinctItems.length}개 중 미연결 {unresolvedCount}개
+            {matchLoading && " · 검색 중..."}
+          </p>
           <table className="dense-table">
             <thead>
               <tr>
@@ -447,32 +463,109 @@ export function SalesUploadPage() {
               </tr>
             </thead>
             <tbody>
-              {distinctItems.map((item) => (
-                <tr key={item}>
-                  <td>{item}</td>
-                  <td>
-                    <select
-                      value={itemMatches[item] ?? ""}
-                      onChange={(e) =>
-                        setItemMatches((prev) => ({ ...prev, [item]: e.target.value as string | "skip" }))
-                      }
-                    >
-                      <option value="">선택 필요</option>
-                      <option value="skip">건너뛰기(거래 행이 아님으로 확인)</option>
-                      {productOptions.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.name} {p.spec}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
-                </tr>
-              ))}
+              {distinctItems.map((item) => {
+                const info = matchInfo[item];
+                const matchedId = itemMatches[item];
+                const matchedProduct =
+                  matchedId && matchedId !== "skip"
+                    ? info?.candidates.find((c) => c.product_id === matchedId)
+                    : null;
+                const isPickerOpen = pickerOpenFor === item;
+
+                return (
+                  <tr key={item}>
+                    <td>{item}</td>
+                    <td>
+                      {matchedId === "skip" && (
+                        <span>
+                          건너뛰기(거래 행 아님)
+                          <button type="button" onClick={() => setPickerOpenFor(item)}>
+                            변경
+                          </button>
+                        </span>
+                      )}
+                      {matchedProduct && !isPickerOpen && (
+                        <span>
+                          {matchedProduct.name} {matchedProduct.spec} ({matchedProduct.base_unit})
+                          <button type="button" onClick={() => setPickerOpenFor(item)}>
+                            변경
+                          </button>
+                        </span>
+                      )}
+                      {!matchedId && !isPickerOpen && info && info.candidates.length > 0 && (
+                        <div>
+                          <p className="form-message">
+                            이름이 같은 상품이 여러 규격으로 등록되어 있어 자동으로 고르지
+                            않았습니다. 맞는 규격을 선택하세요.
+                          </p>
+                          <ul className="search-results">
+                            {info.candidates.map((c) => (
+                              <li key={c.product_id}>
+                                <button type="button" onClick={() => chooseMatch(item, c.product_id)}>
+                                  {c.name} {c.spec} ({c.base_unit})
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                          <button type="button" onClick={() => setPickerOpenFor(item)}>
+                            다른 상품 검색
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setItemMatches((prev) => ({ ...prev, [item]: "skip" }))}
+                          >
+                            건너뛰기(거래 행 아님)
+                          </button>
+                        </div>
+                      )}
+                      {!matchedId && !isPickerOpen && info && info.candidates.length === 0 && (
+                        <div>
+                          <p className="form-message">검색 결과가 없습니다.</p>
+                          <button type="button" onClick={() => setPickerOpenFor(item)}>
+                            상품 검색·등록
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setItemMatches((prev) => ({ ...prev, [item]: "skip" }))}
+                          >
+                            건너뛰기(거래 행 아님)
+                          </button>
+                        </div>
+                      )}
+                      {isPickerOpen && (
+                        <div style={{ border: "1px solid var(--border)", borderRadius: "6px", padding: "8px" }}>
+                          <label style={{ flexDirection: "row", alignItems: "center", gap: "6px" }}>
+                            <input
+                              type="checkbox"
+                              checked={saveAliasFor[item] !== false}
+                              onChange={(e) =>
+                                setSaveAliasFor((prev) => ({ ...prev, [item]: e.target.checked }))
+                              }
+                            />
+                            이 연결을 다음 업로드에도 자동 인식되도록 저장
+                          </label>
+                          <ProductSearchBox
+                            defaultObservedFrom={periodStart}
+                            onSelect={(p: ProductSearchResult) => chooseMatch(item, p.product_id)}
+                          />
+                          <button type="button" onClick={() => setPickerOpenFor(null)}>
+                            닫기
+                          </button>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
           <button
             type="button"
-            disabled={unresolvedCount > 0 || (mode === "catpos" && catposErrors.length > 0 && !catposErrorsAcknowledged)}
+            disabled={
+              unresolvedCount > 0 ||
+              matchLoading ||
+              (mode === "catpos" && catposErrors.length > 0 && !catposErrorsAcknowledged)
+            }
             onClick={() => setStep("preview")}
           >
             다음: 미리보기
@@ -603,8 +696,10 @@ export function SalesUploadPage() {
               setResult(null);
               setRowOverrides({});
               setGapsAcknowledged(false);
-              setProductOptions([]);
+              setMatchInfo({});
               setItemMatches({});
+              setSaveAliasFor({});
+              setPickerOpenFor(null);
             }}
           >
             새 파일 업로드

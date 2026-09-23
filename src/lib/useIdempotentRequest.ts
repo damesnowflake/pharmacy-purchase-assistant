@@ -14,7 +14,7 @@ import { useCallback, useRef } from "react";
 export function useIdempotentRequest(storageKey: string) {
   const pendingRef = useRef<{ key: string; requestId: string } | null>(null);
 
-  function readStorage(): { key: string; requestId: string } | null {
+  const readStorage = useCallback((): { key: string; requestId: string } | null => {
     try {
       const raw = sessionStorage.getItem(storageKey);
       if (!raw) return null;
@@ -24,16 +24,19 @@ export function useIdempotentRequest(storageKey: string) {
     } catch {
       return null;
     }
-  }
+  }, [storageKey]);
 
-  function writeStorage(v: { key: string; requestId: string } | null) {
-    try {
-      if (v) sessionStorage.setItem(storageKey, JSON.stringify(v));
-      else sessionStorage.removeItem(storageKey);
-    } catch {
-      // sessionStorage를 쓸 수 없어도(사생활 보호 모드 등) 메모리 상태만으로 계속 동작한다.
-    }
-  }
+  const writeStorage = useCallback(
+    (v: { key: string; requestId: string } | null) => {
+      try {
+        if (v) sessionStorage.setItem(storageKey, JSON.stringify(v));
+        else sessionStorage.removeItem(storageKey);
+      } catch {
+        // sessionStorage를 쓸 수 없어도(사생활 보호 모드 등) 메모리 상태만으로 계속 동작한다.
+      }
+    },
+    [storageKey],
+  );
 
   const getRequestId = useCallback(
     (key: string): string => {
@@ -47,13 +50,13 @@ export function useIdempotentRequest(storageKey: string) {
       writeStorage(next);
       return next.requestId;
     },
-    [storageKey],
+    [readStorage, writeStorage],
   );
 
   const clearPending = useCallback(() => {
     pendingRef.current = null;
     writeStorage(null);
-  }, [storageKey]);
+  }, [writeStorage]);
 
   return { getRequestId, clearPending };
 }

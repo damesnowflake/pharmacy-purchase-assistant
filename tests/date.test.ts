@@ -1,5 +1,23 @@
 import { describe, it, expect } from "vitest";
-import { calculateArrivalDate, sevenDayWindow, type HolidayCoverage } from "../src/lib/date";
+import { calculateArrivalDate, sevenDayWindow, getBusinessDate, type HolidayCoverage } from "../src/lib/date";
+
+describe("getBusinessDate", () => {
+  it("한국 오전 9시 이전은 UTC 기준 전날이어도 한국 날짜 그대로 반환한다", () => {
+    // UTC 2026-09-22 20:00 == KST 2026-09-23 05:00. UTC 기준으로 자르면 09-22가 나와야 정상인
+    // 버그가 재현되고, 이 함수는 09-23을 반환해야 한다.
+    expect(getBusinessDate(new Date("2026-09-22T20:00:00Z"))).toBe("2026-09-23");
+  });
+
+  it("한국 자정 직후는 다음 날로 넘어간다", () => {
+    // UTC 2026-12-31 15:00 == KST 2027-01-01 00:00
+    expect(getBusinessDate(new Date("2026-12-31T15:00:00Z"))).toBe("2027-01-01");
+  });
+
+  it("UTC와 한국 날짜가 같은 낮 시간에는 그대로 일치한다", () => {
+    // UTC 2026-09-23 03:00 == KST 2026-09-23 12:00
+    expect(getBusinessDate(new Date("2026-09-23T03:00:00Z"))).toBe("2026-09-23");
+  });
+});
 
 function coverage(holidays: string[], coveredFrom: string, coveredTo: string): HolidayCoverage {
   const set = new Set(holidays);
