@@ -7,6 +7,8 @@ import { useIdempotentRequest } from "@/lib/useIdempotentRequest";
 import { ProductSearchBox } from "@/features/products/ProductSearchBox";
 import type { ProductSearchResult } from "@/lib/useProductSearch";
 import { useSalesPriority, salesPriorityLabel, type SalesPrioritySummary } from "@/lib/useSalesPriority";
+import { ForecastQualityPanel } from "./ForecastQualityPanel";
+import { forecastWarningLabel } from "@/lib/forecastWarnings";
 
 interface RecommendationRow {
   id: string;
@@ -107,6 +109,7 @@ export function ReviewPage() {
         )}
       </div>
       {message && <p className="form-message">{message}</p>}
+      <ForecastQualityPanel />
       {priority.error && <p className="error-text">판매 순위를 불러오지 못했습니다. 실사 여부를 직접 확인하세요.</p>}
       {priority.data && (
         <details>
@@ -304,7 +307,7 @@ function RecommendationTableRow({
         )}
       </td>
       <td>{rec.products?.base_unit}</td>
-      <td>{warnings.length > 0 ? <span className="warning-badge">{warnings.join(", ")}</span> : "-"}</td>
+      <td>{warnings.length > 0 ? <span className="warning-badge">{warnings.map(forecastWarningLabel).join(", ")}</span> : "-"}</td>
       {isAdmin && (
         <td>
           {filter === "deferred_excluded" ? (

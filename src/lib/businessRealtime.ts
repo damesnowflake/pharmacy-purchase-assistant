@@ -4,10 +4,10 @@ import type { QueryClient } from "@tanstack/react-query";
 export type ConnectionState = "connecting" | "connected" | "retrying";
 export const BUSINESS_CHANGE_KEYS: Record<string, string[]> = {
   recommendations: ["recommendations", "calc_status_summary"],
-  product_state: ["product_state", "recommendations", "calc_status_summary", "movement_history", "excess_receipts"],
+  product_state: ["product_state", "recommendations", "calc_status_summary", "movement_history", "excess_receipts", "forecast_quality"],
   quantity_events: ["product_state", "movement_history", "excess_receipts", "recommendations", "calc_status_summary"],
-  sales_coverage: ["sales_coverage", "recommendations", "calc_status_summary", "sales_priority"],
-  products: ["products", "product_state", "recommendations", "calc_status_summary", "movement_history", "excess_receipts", "sales_priority"],
+  sales_coverage: ["sales_coverage", "recommendations", "calc_status_summary", "sales_priority", "forecast_quality"],
+  products: ["products", "product_state", "recommendations", "calc_status_summary", "movement_history", "excess_receipts", "sales_priority", "forecast_quality"],
   product_aliases: ["products"],
   product_units: ["product_units", "products"],
   suppliers: ["suppliers", "movement_history"],

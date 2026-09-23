@@ -16,6 +16,7 @@ done
 "${psql_cmd[@]}" -f "$repo_dir/tests/sql/workflow_validation.sql"
 "${psql_cmd[@]}" -f "$repo_dir/tests/sql/blocked_queue.sql"
 "${psql_cmd[@]}" -f "$repo_dir/tests/sql/ranking_retention.sql"
+"${psql_cmd[@]}" -f "$repo_dir/tests/sql/forecast_quality.sql"
 "${psql_cmd[@]}" -f "$repo_dir/tests/sql/queue_concurrency_setup.sql" >> "$test_dir/migrations.log"
 # The first session keeps its row lock while the second attempts a claim.
 "${psql_cmd[@]}" -f "$repo_dir/tests/sql/queue_concurrency_worker.sql" > "$test_dir/worker-a.log" &

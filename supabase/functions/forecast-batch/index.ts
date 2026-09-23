@@ -13,6 +13,7 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { Matrix, SVD } from "npm:ml-matrix@6";
 import { businessDate, hasHolidayCoverage } from "./holidayCoverage.ts";
+import { evaluateForecast, trackNegativeForecasts } from "../_shared/forecastQuality.ts";
 
 const BATCH_SIZE = 20;
 const COEFFICIENT_COUNT = 8;
@@ -81,13 +82,13 @@ function trainModel(observations: Observation[]) {
   const lastIdx = sorted.length - 1;
   const trainingEnd = sorted[sorted.length - 1].date;
 
-  function predict(date: IsoDate): number {
+  function predictRaw(date: IsoDate): number {
     const idx = dayIndexOf.has(date)
       ? dayIndexOf.get(date)!
       : lastIdx + (dateRange(trainingEnd, date).length - 1);
     const row = [1, (idx - mean) / std, ...dowDummyRow(dow(date))];
     const raw = row.reduce((acc, v, i) => acc + v * beta[i], 0);
-    return Math.max(0, raw);
+    return raw;
   }
 
   const warningCodes: string[] = [];
@@ -102,7 +103,8 @@ function trainModel(observations: Observation[]) {
     trainingStart: sorted[0].date,
     trainingEnd,
     warningCodes,
-    predict,
+    predict: (date: IsoDate) => Math.max(0,predictRaw(date)),
+    predictRaw,
   };
 }
 
@@ -323,17 +325,22 @@ Deno.serve(async (_req) => {
       if (model.status !== "fitted") {
         reason = "insufficient_history";
       } else {
-        result.model = {
-          model_version: "ols-v1", training_start: model.trainingStart, training_end: model.trainingEnd,
-          n_observed: model.nObserved, n_missing: model.nMissing,
-          coefficients: model.coefficients, warning_codes: model.warningCodes,
-        };
+        const tracked = trackNegativeForecasts(model.predictRaw);
+        const evaluation = evaluateForecast(observations, rows => {
+          const fitted = trainModel(rows);
+          return fitted.status === "fitted" ? fitted.predict : null;
+        });
         const arrival = isCovered(today)
           ? calculateArrivalDate(today, isCovered, (d) => holidaySet.has(d)) : null;
+        // Warnings remain visible even without a receipt, MOQ, or recommendation.
+        // Evaluate the operational arrival+7-day horizon; if holidays are unavailable,
+        // use a clearly bounded 14-day diagnostic horizon, not an invented arrival date.
+        const diagnosticEnd = arrival ? addDays(arrival,6) : addDays(today,14);
+        for (const d of dateRange(addDays(today,1),diagnosticEnd)) tracked.predict(d);
         if (!arrival) {
           reason = "holiday_missing";
         } else {
-          const reference = await computeArrivalReference(supabase, productId, today, arrival, model.predict);
+          const reference = await computeArrivalReference(supabase, productId, today, arrival, tracked.predict);
           if (!reference) {
             reason = "reference_missing";
           } else {
@@ -341,13 +348,13 @@ Deno.serve(async (_req) => {
               kind: reference.anchorKind, anchor_date: reference.anchorDate,
               qty_base: reference.anchorQty,
               estimated_first_day_sales: reference.midDayCorrectionApplied
-                ? model.predict(reference.anchorDate) : null,
+                ? tracked.predict(reference.anchorDate) : null,
             };
             if (reference.historyUnavailable) reason = "historical_sales_missing";
             else if (!product.default_moq) reason = "moq_missing";
             else if (!product.default_order_step) reason = "unit_missing";
             else if (reference.value <= 0) {
-              const sevenDay = dateRange(arrival, addDays(arrival, 6)).reduce((sum, d) => sum + model.predict(d), 0);
+              const sevenDay = dateRange(arrival, addDays(arrival, 6)).reduce((sum, d) => sum + tracked.predict(d), 0);
               const target = Math.max(product.default_moq, sevenDay);
               const step = product.default_order_step as number;
               result.recommendation = {
@@ -362,6 +369,19 @@ Deno.serve(async (_req) => {
             }
           }
         }
+        const negativeForecasts = tracked.negatives();
+        if (negativeForecasts.length) model.warningCodes.push("negative_forecast");
+        const diagnostics = {
+          evaluation, negative_forecasts: negativeForecasts,
+          diagnostic_start: addDays(today,1), diagnostic_end: diagnosticEnd,
+        };
+        result.model = {
+          model_version: "ols-v1", training_start: model.trainingStart, training_end: model.trainingEnd,
+          n_observed: model.nObserved, n_missing: model.nMissing,
+          coefficients: model.coefficients, warning_codes: model.warningCodes, ...diagnostics,
+        };
+        const recommendation = result.recommendation as {basis_json: Record<string,unknown>} | undefined;
+        if (recommendation) Object.assign(recommendation.basis_json,diagnostics);
       }
       result.calc_reason = reason;
       results.push({ product_id: productId, status: await finish(reason ? "blocked" : "done", result) });

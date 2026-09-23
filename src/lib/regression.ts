@@ -3,6 +3,7 @@
 // 역행렬을 직접 계산하지 않고 SVD(특이값분해) 기반 최소제곱으로 풀어 rank 부족을 함께 검출한다.
 import { Matrix, SVD } from "ml-matrix";
 import { type IsoDate, dayOfWeek, dateRange } from "./date";
+import { evaluateForecast } from "../../supabase/functions/_shared/forecastQuality";
 
 export const COEFFICIENT_COUNT = 8; // intercept, day_trend, 6 dow dummies (일요일 기준 제외)
 export const MIN_OBSERVATIONS_TO_FIT = COEFFICIENT_COUNT;
@@ -34,7 +35,7 @@ export interface FittedModel {
   dayIndexMean: number;
   dayIndexStd: number;
   warningCodes: ForecastWarningCode[];
-  /** 예측 함수. f(d) = max(0, raw). raw가 음수이면 negativeRaw에 원값을 남긴다. */
+  /** 예측 함수. raw를 보존하며 계산용 clamped = max(0, raw). */
   predict(date: IsoDate): { raw: number; clamped: number };
 }
 
@@ -153,33 +154,11 @@ export function timeSeriesBacktest(
   modelVersion: string,
   holdoutDays = 28,
 ): BacktestResult | { status: "insufficient_data" } {
-  const sorted = [...observations].sort((a, b) => (a.date < b.date ? -1 : 1));
-  if (sorted.length <= holdoutDays + MIN_OBSERVATIONS_TO_FIT) {
-    return { status: "insufficient_data" };
-  }
-  const splitIndex = sorted.length - holdoutDays;
-  const holdout = sorted.slice(splitIndex).filter((o) => o.status === "observed");
-
-  let sumAbsError = 0;
-  let sumAbsActual = 0;
-  let n = 0;
-
-  for (const point of holdout) {
-    const trainSlice = sorted.filter((o) => o.date < point.date);
-    const model = trainDemandModel(trainSlice, modelVersion);
-    if (model.status !== "fitted") continue;
-    const { clamped } = model.predict(point.date);
-    const actual = point.netQty ?? 0;
-    sumAbsError += Math.abs(actual - clamped);
-    sumAbsActual += Math.abs(actual);
-    n += 1;
-  }
-
-  if (n === 0) return { status: "insufficient_data" };
-
-  return {
-    mae: sumAbsError / n,
-    wape: sumAbsActual === 0 ? null : sumAbsError / sumAbsActual,
-    n,
+  const result = evaluateForecast(observations, rows => {
+    const model = trainDemandModel(rows,modelVersion);
+    return model.status === "fitted" ? date => model.predict(date).clamped : null;
+  },holdoutDays);
+  return result.status === "insufficient_data" ? {status:"insufficient_data"} : {
+    mae: result.mae!, wape: result.wape, n: result.n,
   };
 }
