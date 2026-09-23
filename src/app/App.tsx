@@ -7,6 +7,7 @@ import { ReceiptsPage } from "@/features/receipts/ReceiptsPage";
 import { SalesUploadPage } from "@/features/sales/SalesUploadPage";
 import { WaitingPage } from "@/features/waiting/WaitingPage";
 import { SettingsPage } from "@/features/settings/SettingsPage";
+import { isSupabaseConfigured } from "@/lib/supabaseClient";
 
 function RequireActiveAccount({ children }: { children: React.ReactNode }) {
   const { session, profile, loading } = useAuth();
@@ -27,6 +28,14 @@ function RequireAdmin({ children }: { children: React.ReactNode }) {
 }
 
 export function App() {
+  if (!isSupabaseConfigured) {
+    return (
+      <div className="center-message">
+        Supabase 연결 설정(VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY)이 없습니다. 배포 환경변수를
+        확인해 주세요.
+      </div>
+    );
+  }
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
