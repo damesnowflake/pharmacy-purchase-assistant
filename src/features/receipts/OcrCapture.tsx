@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { supabase } from "@/lib/supabaseClient";
 import { extractRowCandidates, type OcrRowCandidate } from "@/lib/ocrRowExtraction";
-import { normalizeAliasText } from "@/lib/salesFileParsing";
+import { matchSalesItems, type MatchResult } from "@/lib/productMatching";
+import type { ProductSearchResult } from "@/lib/useProductSearch";
 
 // FR-11~12, IR-08, NFR-08: 기기 내 OCR로 품목·수량 후보를 뽑고, 직원이 수정·확정한 값만
 // 서버로 보낸다. 사진 원본과 OCR 전체 원문은 이 컴포넌트 밖으로 나가지 않으며, 저장 성공 여부와
@@ -9,18 +9,17 @@ import { normalizeAliasText } from "@/lib/salesFileParsing";
 // 실제 입고장 사진 표본과 iPhone 실기기 확인이 없어(D-04, docs/미확인_항목.md), 줄 끝 숫자를
 // 수량으로 보는 v1 규칙의 인식 정확도는 검증되지 않았다 — 그래서 모든 후보를 직원이 반드시
 // 확인·수정한 뒤에만 저장되도록 만들었다.
-
-interface ProductOption {
-  id: string;
-  name: string;
-  spec: string;
-  base_unit: string;
-}
+//
+// 품목 후보는 줄마다 search_products로 조회한다(사입추천시스템_사용_시나리오_검토.md 시나리오
+// 6). 예전에는 상품 전체를 한 번에 select해 이름만으로 정규화한 Map에 넣어, 이름이 같고 규격이
+// 다른 상품이 있으면 뒤에 온 쪽이 앞의 상품을 덮어썼다 — 지금은 후보가 정확히 하나이고 이름이
+// 완전히 일치할 때만 자동 연결하고, 그 외에는 드롭다운에서 규격을 보고 직접 고르게 한다.
 
 interface ResolvedCandidate extends OcrRowCandidate {
   key: string;
   productId: string | "skip" | "";
   qtyText: string;
+  candidates: ProductSearchResult[];
 }
 
 export function OcrCapture({
@@ -32,8 +31,6 @@ export function OcrCapture({
   const [status, setStatus] = useState<"idle" | "recognizing" | "review">("idle");
   const [progress, setProgress] = useState(0);
   const [candidates, setCandidates] = useState<ResolvedCandidate[]>([]);
-  const [productOptions, setProductOptions] = useState<ProductOption[]>([]);
-  const [aliasIndex, setAliasIndex] = useState<Map<string, string>>(new Map());
   const [error, setError] = useState<string | null>(null);
   const imageUrlRef = useRef<string | null>(null);
 
@@ -48,26 +45,6 @@ export function OcrCapture({
     };
   }, []);
 
-  async function loadProductIndex() {
-    const { data, error } = await supabase
-      .from("products")
-      .select("id, name, spec, base_unit, product_aliases(normalized_alias)")
-      .eq("active", true);
-    if (error) {
-      setError(`품목 목록 조회 실패: ${error.message}`);
-      return;
-    }
-    setProductOptions((data ?? []).map((p) => ({ id: p.id, name: p.name, spec: p.spec, base_unit: p.base_unit })));
-    const idx = new Map<string, string>();
-    for (const p of data ?? []) {
-      idx.set(normalizeAliasText(p.name as string), p.id as string);
-      for (const a of (p.product_aliases ?? []) as { normalized_alias: string }[]) {
-        idx.set(a.normalized_alias, p.id as string);
-      }
-    }
-    setAliasIndex(idx);
-  }
-
   async function handleFile(file: File) {
     setError(null);
     if (imageUrl) URL.revokeObjectURL(imageUrl);
@@ -75,7 +52,6 @@ export function OcrCapture({
     setImageUrl(url);
     setStatus("recognizing");
     setProgress(0);
-    await loadProductIndex();
 
     // Tesseract.js는 번들 크기가 커서(WASM 코어 포함) 실제로 촬영을 시작할 때만 불러온다.
     const { createWorker } = await import("tesseract.js");
@@ -90,13 +66,22 @@ export function OcrCapture({
       const lines = (data.blocks ?? []).flatMap((b) => b.paragraphs.flatMap((p) => p.lines));
       const rowCandidates = extractRowCandidates(lines);
 
+      const distinctItems = Array.from(new Set(rowCandidates.map((c) => c.itemCandidate).filter(Boolean)));
+      let matchInfo: Map<string, MatchResult> = new Map();
+      try {
+        matchInfo = await matchSalesItems(distinctItems);
+      } catch (e) {
+        setError(`품목 검색 실패: ${(e as Error).message}. 아래에서 직접 골라도 됩니다.`);
+      }
+
       const resolved: ResolvedCandidate[] = rowCandidates.map((c, i) => {
-        const guess = aliasIndex.get(normalizeAliasText(c.itemCandidate));
+        const info = matchInfo.get(c.itemCandidate);
         return {
           ...c,
           key: `${i}-${c.rawText}`,
-          productId: guess ?? "",
+          productId: info?.autoMatchedId ?? "",
           qtyText: c.qtyCandidate !== null ? String(c.qtyCandidate) : "",
+          candidates: info?.candidates ?? [],
         };
       });
       setCandidates(resolved);
@@ -119,10 +104,10 @@ export function OcrCapture({
       if (!c.productId || c.productId === "skip") continue;
       const qty = Number(c.qtyText);
       if (!qty || qty <= 0) continue;
-      const product = productOptions.find((p) => p.id === c.productId);
+      const product = c.candidates.find((p) => p.product_id === c.productId);
       if (!product) continue;
       onResolved({
-        productId: product.id,
+        productId: product.product_id,
         label: `${product.name} ${product.spec}`.trim(),
         quantity: String(qty),
         unit: product.base_unit,
@@ -185,12 +170,15 @@ export function OcrCapture({
                     >
                       <option value="">선택 필요</option>
                       <option value="skip">건너뛰기</option>
-                      {productOptions.map((p) => (
-                        <option key={p.id} value={p.id}>
+                      {c.candidates.map((p) => (
+                        <option key={p.product_id} value={p.product_id}>
                           {p.name} {p.spec}
                         </option>
                       ))}
                     </select>
+                    {c.candidates.length === 0 && (
+                      <span className="form-message">검색 결과 없음 — 입고 화면에서 등록 후 다시 촬영하세요.</span>
+                    )}
                   </td>
                   <td className="num">
                     <input
