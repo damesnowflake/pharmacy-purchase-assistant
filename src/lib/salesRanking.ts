@@ -43,7 +43,7 @@ export function rankTopProducts(products: ProductRecentSales[]): RankedProduct[]
   return sorted.map((p, i) => ({
     ...p,
     rank: i + 1,
-    isTop50: i < TOP_N,
+    isTop50: i < TOP_N && p.observedSum > 0,
     isPartialWindow: p.observedDays < RANKING_WINDOW_DAYS,
   }));
 }

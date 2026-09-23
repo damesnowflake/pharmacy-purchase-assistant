@@ -2,13 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import { extractRowCandidates, type OcrRowCandidate } from "@/lib/ocrRowExtraction";
 import { matchSalesItems, type MatchResult } from "@/lib/productMatching";
 import type { ProductSearchResult } from "@/lib/useProductSearch";
+import { ProductSearchBox } from "@/features/products/ProductSearchBox";
 
 // FR-11~12, IR-08, NFR-08: 기기 내 OCR로 품목·수량 후보를 뽑고, 직원이 수정·확정한 값만
 // 서버로 보낸다. 사진 원본과 OCR 전체 원문은 이 컴포넌트 밖으로 나가지 않으며, 저장 성공 여부와
 // 무관하게 결과를 확정한 뒤에는 이미지·워커를 즉시 해제한다.
-// 실제 입고장 사진 표본과 iPhone 실기기 확인이 없어(D-04, docs/미확인_항목.md), 줄 끝 숫자를
-// 수량으로 보는 v1 규칙의 인식 정확도는 검증되지 않았다 — 그래서 모든 후보를 직원이 반드시
-// 확인·수정한 뒤에만 저장되도록 만들었다.
+// 수량 열의 좌표 또는 명시적 수량 라벨만 사용한다. 모호한 수량은 빈칸으로 두고 확인을 요구한다.
 //
 // 품목 후보는 줄마다 search_products로 조회한다(사입추천시스템_사용_시나리오_검토.md 시나리오
 // 6). 예전에는 상품 전체를 한 번에 select해 이름만으로 정규화한 Map에 넣어, 이름이 같고 규격이
@@ -32,6 +31,7 @@ export function OcrCapture({
   const [progress, setProgress] = useState(0);
   const [candidates, setCandidates] = useState<ResolvedCandidate[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [confirmed, setConfirmed] = useState(false);
   const imageUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -47,8 +47,10 @@ export function OcrCapture({
 
   async function handleFile(file: File) {
     setError(null);
+    setConfirmed(false);
     if (imageUrl) URL.revokeObjectURL(imageUrl);
     const url = URL.createObjectURL(file);
+    imageUrlRef.current = url;
     setImageUrl(url);
     setStatus("recognizing");
     setProgress(0);
@@ -62,7 +64,7 @@ export function OcrCapture({
           if (m.status === "recognizing text") setProgress(m.progress);
         },
       });
-      const { data } = await worker.recognize(file, {}, { blocks: true });
+      const { data } = await worker.recognize(file, { rotateAuto: true }, { blocks: true });
       const lines = (data.blocks ?? []).flatMap((b) => b.paragraphs.flatMap((p) => p.lines));
       const rowCandidates = extractRowCandidates(lines);
 
@@ -96,10 +98,12 @@ export function OcrCapture({
   }
 
   function updateCandidate(key: string, patch: Partial<ResolvedCandidate>) {
+    setConfirmed(false);
     setCandidates((prev) => prev.map((c) => (c.key === key ? { ...c, ...patch } : c)));
   }
 
   function confirmAll() {
+    if (!confirmed || unresolvedCount > 0) return;
     for (const c of candidates) {
       if (!c.productId || c.productId === "skip") continue;
       const qty = Number(c.qtyText);
@@ -119,12 +123,16 @@ export function OcrCapture({
   function reset() {
     if (imageUrl) URL.revokeObjectURL(imageUrl);
     setImageUrl(null);
+    imageUrlRef.current = null;
     setCandidates([]);
     setStatus("idle");
     setProgress(0);
+    setConfirmed(false);
   }
 
-  const readyCount = candidates.filter((c) => c.productId && c.productId !== "skip" && Number(c.qtyText) > 0).length;
+  const isReady = (c: ResolvedCandidate) => c.candidates.some(p => p.product_id === c.productId) && Number.isFinite(Number(c.qtyText)) && Number(c.qtyText) > 0;
+  const readyCount = candidates.filter(isReady).length;
+  const unresolvedCount = candidates.filter(c => c.productId !== "skip" && !isReady(c)).length;
 
   return (
     <div className="ocr-capture">
@@ -151,6 +159,8 @@ export function OcrCapture({
             인식된 줄 {candidates.length}개 중 확정 가능 {readyCount}개. 품목과 수량을 확인·수정한
             뒤 저장 목록에 담으세요. 사진과 인식 원문은 서버로 전송되지 않습니다.
           </p>
+          {imageUrl && <img src={imageUrl} alt="기기 내 입고장 확인용 사진" style={{ maxWidth: "100%", maxHeight: 360, objectFit: "contain" }} />}
+          <p className="form-message">수량 열을 찾지 못한 줄은 빈칸입니다. 미확정 {unresolvedCount}개를 수정하거나 명시적으로 건너뛰세요.</p>
           <table className="dense-table">
             <thead>
               <tr>
@@ -176,9 +186,9 @@ export function OcrCapture({
                         </option>
                       ))}
                     </select>
-                    {c.candidates.length === 0 && (
-                      <span className="form-message">검색 결과 없음 — 입고 화면에서 등록 후 다시 촬영하세요.</span>
-                    )}
+                    <ProductSearchBox placeholder="다른 상품 검색·등록" onSelect={p => updateCandidate(c.key, {
+                      productId: p.product_id, candidates: [...c.candidates.filter(x => x.product_id !== p.product_id), p],
+                    })} />
                   </td>
                   <td className="num">
                     <input
@@ -189,13 +199,15 @@ export function OcrCapture({
                       onChange={(e) => updateCandidate(c.key, { qtyText: e.target.value })}
                       style={{ width: "70px" }}
                     />
+                    <span className="form-message">{c.quantitySource === "unresolved" ? "수량 직접 확인" : "인식 수량 확인 필요"}</span>
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
+          <label><input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} />상품·규격·수량을 사진과 대조했습니다.</label>
           <div style={{ display: "flex", gap: "6px" }}>
-            <button type="button" disabled={readyCount === 0} onClick={confirmAll}>
+            <button type="button" disabled={readyCount === 0 || unresolvedCount > 0 || !confirmed} onClick={confirmAll}>
               확정한 {readyCount}건 목록에 담기
             </button>
             <button type="button" onClick={reset}>

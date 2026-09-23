@@ -5,10 +5,8 @@
 // 핵심 계산식을 이 파일에 이식했다. src/lib/regression.ts·recommendation.ts·inventoryAnchor.ts와
 // 로직이 갈라지지 않도록, 두 쪽을 수정할 때는 항상 함께 확인한다.
 //
-// 미구현 범위 (docs/미확인_항목.md 참고, 완료로 표시하지 않음):
-//  - 실사·최근입고 시각 비교에서 같은 시각에 걸친 사건의 순서(included_event_seq)는 occurred_at
-//    단순 비교로 근사했다. 초 단위까지 같은 시각이 실제로 발생하면 정확하지 않을 수 있다.
-//  - 이 함수는 실제 Supabase 프로젝트에 배포해 실행 로그로 검증한 적이 없다.
+// 판매 차감은 reference_sales_total RPC로 보존기간 밖 누적분까지 읽는다.
+// 이 변경은 migration 0020 적용 후 배포한다. 실제 iPhone OCR/예측 정확도는 별도 현장 검증 대상이다.
 //
 // 필요한 환경변수: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (Supabase가 자동 주입)
 
@@ -132,6 +130,7 @@ interface ReferenceResult {
   anchorDate: IsoDate;
   anchorQty: number;
   dataInsufficient: boolean;
+  historyUnavailable: boolean;
   forecastUnavailable: boolean;
   midDayCorrectionApplied: boolean;
 }
@@ -147,16 +146,25 @@ async function computeArrivalReference(
   productId: string,
   today: IsoDate,
   arrival: IsoDate,
-  dailyMap: Map<string, number>,
   predict: (d: IsoDate) => number,
 ): Promise<ReferenceResult | null> {
+  const actualSales = async (start: IsoDate) => {
+    const { data, error } = await supabase.rpc("reference_sales_total", {
+      p_product_id: productId, p_start: start, p_end: today,
+    });
+    if (error) throw error;
+    if (!data || !Number.isFinite(Number(data.net_qty))) throw new Error("INVALID_REFERENCE_TOTAL");
+    return { sum: Number(data.net_qty), insufficient: data.missing_days > 0,
+      unavailable: Boolean(data.history_unavailable) };
+  };
   const { data: lastCountRows, error: countError } = await supabase
     .from("quantity_events")
-    .select("occurred_at, qty_base, day_boundary")
+    .select("occurred_at, qty_base, day_boundary, recorded_seq")
     .eq("product_id", productId)
     .eq("kind", "count")
     .eq("active", true)
     .order("occurred_at", { ascending: false })
+    .order("recorded_seq", { ascending: false })
     .limit(1);
   if (countError) throw countError;
   const lastCount = lastCountRows?.[0];
@@ -174,38 +182,34 @@ async function computeArrivalReference(
 
     const { data: afterEvents, error: eventsError } = await supabase
       .from("quantity_events")
-      .select("kind, qty_base")
+      .select("kind, qty_base, occurred_at, recorded_seq")
       .eq("product_id", productId)
       .eq("active", true)
       .in("kind", ["receipt", "stock_adjustment"])
-      .gt("occurred_at", lastCount.occurred_at);
+      .gte("occurred_at", lastCount.occurred_at);
     if (eventsError) throw eventsError;
-    const receiptsAfter = (afterEvents ?? [])
+    const followingEvents = (afterEvents ?? []).filter((e: { occurred_at: string; recorded_seq: number }) =>
+      e.occurred_at !== lastCount.occurred_at || e.recorded_seq > lastCount.recorded_seq);
+    const receiptsAfter = followingEvents
       .filter((e: { kind: string }) => e.kind === "receipt")
       .reduce((a: number, e: { qty_base: number }) => a + e.qty_base, 0);
-    const adjustmentsAfter = (afterEvents ?? [])
+    const adjustmentsAfter = followingEvents
       .filter((e: { kind: string }) => e.kind === "stock_adjustment")
       .reduce((a: number, e: { qty_base: number }) => a + e.qty_base, 0);
 
     const dayAfterCount = addDays(countDate, 1);
-    const actualRange = dateRange(dayAfterCount, today);
-    let actualSum = 0;
-    let dataInsufficient = false;
-    for (const d of actualRange) {
-      const v = dailyMap.get(d);
-      if (v === undefined) dataInsufficient = true;
-      else actualSum += v;
-    }
+    const actual = await actualSales(dayAfterCount);
     const forecastStart = dayAfterCount > addDays(today, 1) ? dayAfterCount : addDays(today, 1);
     const forecastSum = dateRange(forecastStart, arrival).reduce((acc, d) => acc + predict(d), 0);
 
-    const value = lastCount.qty_base + receiptsAfter + adjustmentsAfter - midDayCorrection - actualSum - forecastSum;
+    const value = lastCount.qty_base + receiptsAfter + adjustmentsAfter - midDayCorrection - actual.sum - forecastSum;
     return {
       value,
       anchorKind: "stock_count",
       anchorDate: countDate,
       anchorQty: lastCount.qty_base,
-      dataInsufficient,
+      dataInsufficient: actual.insufficient,
+      historyUnavailable: actual.unavailable,
       forecastUnavailable: false,
       midDayCorrectionApplied,
     };
@@ -234,24 +238,18 @@ async function computeArrivalReference(
   if (receiptDayError) throw receiptDayError;
   const Q = (receiptsOnB ?? []).reduce((a: number, r: { qty_base: number }) => a + r.qty_base, 0);
 
-  const actualRange = B <= today ? dateRange(B, today) : [];
-  let actualSum = 0;
-  let dataInsufficient = false;
-  for (const d of actualRange) {
-    const v = dailyMap.get(d);
-    if (v === undefined) dataInsufficient = true;
-    else actualSum += v;
-  }
+  const actual = await actualSales(B);
   const forecastStart = B > addDays(today, 1) ? B : addDays(today, 1);
   const forecastSum = dateRange(forecastStart, arrival).reduce((acc, d) => acc + predict(d), 0);
-  const value = Q - actualSum - forecastSum;
+  const value = Q - actual.sum - forecastSum;
 
   return {
     value,
     anchorKind: "last_receipt",
     anchorDate: B,
     anchorQty: Q,
-    dataInsufficient,
+    dataInsufficient: actual.insufficient,
+    historyUnavailable: actual.unavailable,
     forecastUnavailable: false,
     midDayCorrectionApplied: false,
   };
@@ -335,7 +333,7 @@ Deno.serve(async (_req) => {
         if (!arrival) {
           reason = "holiday_missing";
         } else {
-          const reference = await computeArrivalReference(supabase, productId, today, arrival, dailyMap, model.predict);
+          const reference = await computeArrivalReference(supabase, productId, today, arrival, model.predict);
           if (!reference) {
             reason = "reference_missing";
           } else {
@@ -345,7 +343,8 @@ Deno.serve(async (_req) => {
               estimated_first_day_sales: reference.midDayCorrectionApplied
                 ? model.predict(reference.anchorDate) : null,
             };
-            if (!product.default_moq) reason = "moq_missing";
+            if (reference.historyUnavailable) reason = "historical_sales_missing";
+            else if (!product.default_moq) reason = "moq_missing";
             else if (!product.default_order_step) reason = "unit_missing";
             else if (reference.value <= 0) {
               const sevenDay = dateRange(arrival, addDays(arrival, 6)).reduce((sum, d) => sum + model.predict(d), 0);

@@ -7,6 +7,7 @@ import { OcrCapture } from "./OcrCapture";
 import { ProductSearchBox } from "@/features/products/ProductSearchBox";
 import type { ProductSearchResult } from "@/lib/useProductSearch";
 import type { ProductUnit } from "@/lib/useProductUnits";
+import { useSalesPriority, salesPriorityLabel } from "@/lib/useSalesPriority";
 
 interface ReceiptLine {
   lineId: string;
@@ -47,6 +48,7 @@ function toKstTimestamp(datetimeLocalValue: string): string {
 // 등록이 끝나면 그 상품이 자동으로 입고 행에 추가되고, 이미 입력해 둔 다른 행·수량은 그대로
 // 유지된다(별도 상태를 건드리지 않고 lines 배열에 더하기만 함).
 export function ReceiptsPage() {
+  const priority = useSalesPriority();
   const { profile } = useAuth();
   const queryClient = useQueryClient();
   const [lines, setLines] = useState<ReceiptLine[]>([]);
@@ -161,6 +163,8 @@ export function ReceiptsPage() {
         {showOcr && <OcrCapture onResolved={addFromOcr} />}
 
         <h3>수동 입력</h3>
+        <p className="form-message">최근 30일 판매 상위 50개는 통계 중심으로 검토합니다. 그 외 품목은 입고 시 아래 실사 입력을 권장합니다. 실사하지 않아도 입고 등록은 가능합니다.</p>
+        {priority.error && <p className="error-text">판매 순위 조회 실패 — 순위를 단정하지 않고 실사 여부를 확인하세요.</p>}
         <ProductSearchBox onSelect={addProduct} placeholder="품명·규격·별칭·바코드로 검색" />
 
         {lines.length > 0 && (
@@ -176,7 +180,7 @@ export function ReceiptsPage() {
             <tbody>
               {lines.map((l) => (
                 <tr key={l.lineId}>
-                  <td>{l.label}</td>
+                  <td>{l.label}<div className="form-message">{salesPriorityLabel(priority.data, l.productId)}</div></td>
                   <td className="num">
                     <input
                       type="number"

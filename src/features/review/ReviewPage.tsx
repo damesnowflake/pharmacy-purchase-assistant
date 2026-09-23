@@ -6,6 +6,7 @@ import { getBusinessDate } from "@/lib/date";
 import { useIdempotentRequest } from "@/lib/useIdempotentRequest";
 import { ProductSearchBox } from "@/features/products/ProductSearchBox";
 import type { ProductSearchResult } from "@/lib/useProductSearch";
+import { useSalesPriority, salesPriorityLabel, type SalesPrioritySummary } from "@/lib/useSalesPriority";
 
 interface RecommendationRow {
   id: string;
@@ -33,6 +34,7 @@ function invalidateAfterDecision(queryClient: ReturnType<typeof useQueryClient>)
 // IR-04 사입 검토: 체크리스트, 수요·수량 근거, 도착일, 경고, 수량 수정·보류·제외·발주 완료.
 // 발주 완료·보류·제외·수동 발주는 관리자만 가능하다 (FR-03). 직원은 근거를 조회만 한다.
 export function ReviewPage() {
+  const priority = useSalesPriority();
   const { profile } = useAuth();
   const queryClient = useQueryClient();
   const [filter, setFilter] = useState<"active" | "deferred_excluded">("active");
@@ -45,7 +47,7 @@ export function ReviewPage() {
       const { data, error } = await supabase.rpc("calc_status_summary");
       if (error) throw error;
       return data as { calculating: number; blocked: number; review: number;
-        missing_reference?: number; missing_moq?: number; missing_order_step?: number };
+        missing_reference?: number; missing_moq?: number; missing_order_step?: number; missing_historical_sales?: number };
     },
     refetchInterval: 30_000,
   });
@@ -88,6 +90,7 @@ export function ReviewPage() {
           {calcSummary.missing_reference !== undefined && (
             <span> · 입고/실사 필요 {calcSummary.missing_reference}개 · MOQ 필요 {calcSummary.missing_moq}개 · 발주단위 필요 {calcSummary.missing_order_step}개 (중복 집계)</span>
           )}
+          {!!calcSummary.missing_historical_sales && <span className="error-text"> · 과거 판매자료 복원 불가 {calcSummary.missing_historical_sales}개 — 입고 화면에서 현재 수량을 실사로 등록하세요.</span>}
         </p>
       )}
       <div style={{ display: "flex", gap: "4px", marginBottom: "8px" }}>
@@ -104,6 +107,15 @@ export function ReviewPage() {
         )}
       </div>
       {message && <p className="form-message">{message}</p>}
+      {priority.error && <p className="error-text">판매 순위를 불러오지 못했습니다. 실사 여부를 직접 확인하세요.</p>}
+      {priority.data && (
+        <details>
+          <summary>판매 상위 50개 · {priority.data.window_start}~{priority.data.window_end} · 자료 확보 {priority.data.observed_days}/30일</summary>
+          <p>순위는 실사 우선순위 안내에만 사용하며 추천수량과 기존 재고 기준점을 변경하지 않습니다.</p>
+          <ol>{priority.data.products.map(p => <li key={p.product_id}>{p.name} {p.spec} — {p.net_qty} 기준단위{p.partial_window ? " (관측기간 부족)" : ""}</li>)}</ol>
+          {!priority.data.products.length && <p>해당 기간에 양의 순판매량이 있는 품목이 없습니다.</p>}
+        </details>
+      )}
 
       {manualOrderOpen && isAdmin && (
         <ManualOrderPanel
@@ -143,6 +155,7 @@ export function ReviewPage() {
               <RecommendationTableRow
                 key={r.id}
                 rec={r}
+                priority={priority.data}
                 isAdmin={isAdmin}
                 suppliers={suppliers ?? []}
                 userId={profile?.user_id ?? ""}
@@ -160,6 +173,7 @@ export function ReviewPage() {
 
 function RecommendationTableRow({
   rec,
+  priority,
   isAdmin,
   suppliers,
   userId,
@@ -168,6 +182,7 @@ function RecommendationTableRow({
   onChanged,
 }: {
   rec: RecommendationRow;
+  priority?: SalesPrioritySummary;
   isAdmin: boolean;
   suppliers: SupplierOption[];
   userId: string;
@@ -262,7 +277,7 @@ function RecommendationTableRow({
 
   return (
     <tr>
-      <td>{rec.products?.name ?? rec.product_id}</td>
+      <td>{rec.products?.name ?? rec.product_id}<div className="form-message">{salesPriorityLabel(priority, rec.product_id)}</div></td>
       <td>{rec.products?.spec}</td>
       <td>{referenceKind === "stock_count" ? "실사" : referenceKind === "last_receipt" ? "최근 입고" : "-"}</td>
       <td className="num">
