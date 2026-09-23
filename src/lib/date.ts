@@ -3,6 +3,24 @@
 
 export type IsoDate = string; // "YYYY-MM-DD"
 
+const KST_FORMATTER = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Seoul",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+/**
+ * 현재 시각(기본값 now)을 한국 표준시(Asia/Seoul) 달력일로 변환한다. 브라우저 로컬
+ * 시간대와 무관하게 항상 같은 값을 반환한다 (시나리오 4: 한국시간 오전 발주·자정 처리 문제).
+ * `toISOString().slice(0,10)`은 UTC 기준이라 한국 오전 9시 이전에는 하루 이전 날짜가
+ * 나오므로 "현재 시각"을 달력일로 바꿀 때는 반드시 이 함수를 사용한다. 이미 만들어진
+ * 순수 달력일(Date.UTC 기반)을 다루는 계산에는 영향이 없다.
+ */
+export function getBusinessDate(now: Date = new Date()): IsoDate {
+  return KST_FORMATTER.format(now);
+}
+
 export function addCalendarDays(date: IsoDate, days: number): IsoDate {
   const [y, m, d] = date.split("-").map(Number);
   const dt = new Date(Date.UTC(y, m - 1, d));
